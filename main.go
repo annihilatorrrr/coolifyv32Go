@@ -14,10 +14,27 @@
 //
 // All container ops happen on the local Docker daemon; SSH/remote-engine
 // destinations from v3 are not migrated.
+//
+// # Phase-split execution
+//
+// Because install.sh upgrades the host's Docker engine between the data
+// import and the container takeover, the binary supports running in two
+// halves so the wrapper can sandwich the daemon restart cleanly:
+//
+//	coolfymigrater --phase=pre-docker  ...   # discover → freeze → extract → insert, then exit
+//	(install.sh upgrades Docker; daemon comes back)
+//	coolfymigrater --phase=post-docker ...   # reload plan → takeover → teardown
+//
+// State persists between invocations via a JSON file at --state-file
+// (default /var/lib/coolfymigrater/state.json). --phase=all (default) keeps
+// the original single-shot behaviour for operators running without the
+// install.sh wrapper.
 package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -40,15 +57,40 @@ import (
 	v3pkg "coolfymigrater/internal/v3"
 )
 
+const (
+	phaseAll        = "all"
+	phasePreDocker  = "pre-docker"
+	phasePostDocker = "post-docker"
+
+	defaultStateFile = "/var/lib/coolfymigrater/state.json"
+	stateVersion     = 1
+)
+
 type flags struct {
 	coolifygoDSN string
 	coolifygoKey string
 	v3SecretKey  string
 	v3SQLite     string
+	phase        string
+	stateFile    string
 	dryRun       bool
 	yes          bool
 	noTeardown   bool
 }
+
+// state is what `pre-docker` writes to disk and `post-docker` reads back.
+// The full plan carries every NewID that the insert phase allocated plus the
+// v3 workload metadata takeover needs — so the Docker daemon restart in
+// between can mangle live container state freely without losing context.
+type state struct {
+	Plan    *mapper.Plan `json:"plan"`
+	Version int          `json:"version"`
+}
+
+// errDryRun unwinds runPreDocker cleanly without the caller treating it as a
+// real failure. We can't return a nil plan + nil error there because nil-plan
+// would crash the caller.
+var errDryRun = errors.New("dry-run complete")
 
 func main() {
 	f := parseFlags()
@@ -57,6 +99,9 @@ func main() {
 	defer cancel()
 
 	if err := run(ctx, f); err != nil {
+		if errors.Is(err, errDryRun) {
+			return
+		}
 		clilog.Fail("%s", err.Error())
 		os.Exit(1)
 	}
@@ -73,6 +118,10 @@ func parseFlags() flags {
 		"v3 COOLIFY_SECRET_KEY override (auto-detected from coolify container env when blank)")
 	flag.StringVar(&f.v3SQLite, "v3-sqlite", "",
 		"path to v3 prod.db on host (auto-extracted from coolify container when blank)")
+	flag.StringVar(&f.phase, "phase", phaseAll,
+		"execution phase: 'all' (default, single-shot), 'pre-docker' (discover→insert), 'post-docker' (takeover→teardown). Used by install.sh to bracket a Docker engine upgrade.")
+	flag.StringVar(&f.stateFile, "state-file", defaultStateFile,
+		"path where pre-docker writes / post-docker reads the migration plan JSON")
 	flag.BoolVar(&f.dryRun, "dry-run", false, "print the migration plan and exit without changing anything")
 	flag.BoolVar(&f.yes, "yes", false, "skip interactive confirmation prompts")
 	flag.BoolVar(&f.noTeardown, "no-teardown", false, "skip the v3 wipe phase")
@@ -94,17 +143,46 @@ func run(ctx context.Context, f flags) error {
 	if f.coolifygoKey == "" {
 		return fmt.Errorf("--coolifygo-key (or $DATA_ENCRYPTION_KEY) is required")
 	}
+	switch f.phase {
+	case phaseAll, phasePreDocker, phasePostDocker:
+	default:
+		return fmt.Errorf("--phase %q invalid (want all|pre-docker|post-docker)", f.phase)
+	}
 
+	if f.phase == phasePostDocker {
+		return runPostDocker(ctx, f)
+	}
+
+	plan, err := runPreDocker(ctx, f)
+	if err != nil {
+		return err
+	}
+	if f.phase == phasePreDocker {
+		if err = saveState(f.stateFile, plan); err != nil {
+			return fmt.Errorf("save state: %w", err)
+		}
+		clilog.OK("plan saved to %s — invoke --phase=post-docker after Docker upgrade", f.stateFile)
+		return nil
+	}
+	return runTakeoverAndTeardown(ctx, f, plan)
+}
+
+// runPreDocker performs every step that depends on the v3 SQLite, runs the
+// transactional insert into coolifygo's Postgres, and returns the populated
+// plan (NewIDs filled). After this returns, the Docker engine may be torn
+// down and replaced — v3's data is durably persisted, and takeover only
+// needs the named volumes (which survive a daemon restart).
+func runPreDocker(ctx context.Context, f flags) (*mapper.Plan, error) {
 	clilog.Phase(1, 7, "discover v3 stack")
 	dc, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return fmt.Errorf("docker client: %w", err)
+		return nil, fmt.Errorf("docker client: %w", err)
 	}
 	defer dc.Close()
 
 	stack, err := discover.Inspect(ctx, dc)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	clilog.OK("found `coolify` container %s", short(stack.CoolifyContainerID))
 	clilog.OK("found %d workload container(s) on coolify-infra", len(stack.WorkloadContainers))
@@ -115,12 +193,12 @@ func run(ctx context.Context, f flags) error {
 	clilog.Phase(2, 7, "connect coolifygo postgres")
 	target, err := cgo.Open(ctx, f.coolifygoDSN, f.coolifygoKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer target.Close()
 	localServer, err := target.FindLocalServer(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	clilog.OK("local server row: %s", localServer)
 
@@ -145,7 +223,7 @@ func run(ctx context.Context, f flags) error {
 		// SQLite file is fsync'd + consistent.
 		extracted, eerr := discover.ExtractSQLite(ctx, dc, stack.CoolifyContainerID)
 		if eerr != nil {
-			return fmt.Errorf("extract sqlite: %w", eerr)
+			return nil, fmt.Errorf("extract sqlite: %w", eerr)
 		}
 		sqlitePath = extracted
 		defer os.RemoveAll(filepath.Dir(sqlitePath))
@@ -153,25 +231,25 @@ func run(ctx context.Context, f flags) error {
 
 	v3c, err := v3pkg.Open(sqlitePath, stack.SecretKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer v3c.Close()
 
 	apps, err := v3c.Applications()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	dbs, err := v3c.Databases()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sources, err := v3c.GitSources()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ghApps, err := v3c.GitHubApps()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	clilog.OK("read v3: %d apps, %d dbs, %d git sources, %d github apps",
 		len(apps), len(dbs), len(sources), len(ghApps))
@@ -179,24 +257,50 @@ func run(ctx context.Context, f flags) error {
 	clilog.Phase(5, 7, "build migration plan")
 	plan, err := mapper.BuildPlan(localServer, apps, dbs, sources, ghApps, stack.WorkloadContainers)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	printPlan(plan)
 
 	if f.dryRun {
 		clilog.Info("--dry-run set; exiting before any change")
-		return nil
+		return nil, errDryRun
 	}
 
 	if !clilog.Confirm("Proceed with migration?", f.yes) {
-		return fmt.Errorf("aborted by user")
+		return nil, fmt.Errorf("aborted by user")
 	}
 
 	if err = insertAll(ctx, target, plan); err != nil {
-		return fmt.Errorf("insert phase: %w", err)
+		return nil, fmt.Errorf("insert phase: %w", err)
 	}
 	clilog.OK("inserted %d git source(s), %d app(s), %d db(s)",
 		len(plan.GitSources), len(plan.Apps), len(plan.Databases))
+	return plan, nil
+}
+
+// runPostDocker resumes after Docker has been upgraded by install.sh. It
+// re-opens the docker client (the daemon may have a new version + reloaded
+// socket), reloads the plan written by --phase=pre-docker, then performs
+// the container takeover and the optional v3 teardown.
+func runPostDocker(ctx context.Context, f flags) error {
+	plan, err := loadState(f.stateFile)
+	if err != nil {
+		return fmt.Errorf("load state %s: %w", f.stateFile, err)
+	}
+	clilog.OK("resumed from %s — %d apps + %d dbs queued for takeover",
+		f.stateFile, len(plan.Apps), len(plan.Databases))
+	return runTakeoverAndTeardown(ctx, f, plan)
+}
+
+// runTakeoverAndTeardown is the second half of the run, shared by --phase=all
+// (which arrives here with a fresh plan) and --phase=post-docker (which
+// rehydrated the plan from disk).
+func runTakeoverAndTeardown(ctx context.Context, f flags, plan *mapper.Plan) error {
+	dc, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return fmt.Errorf("docker client: %w", err)
+	}
+	defer dc.Close()
 
 	clilog.Phase(6, 7, "take over running containers")
 	if err = takeover.EnsureNetwork(ctx, dc); err != nil {
@@ -219,7 +323,49 @@ func run(ctx context.Context, f flags) error {
 	if err = teardown.Wipe(ctx, dc, os.Stdout); err != nil {
 		clilog.Warn("%s", err)
 	}
+
+	// State file was a hand-off artefact between phases. Once we've taken
+	// over + torn down, nothing should ever read it again, and leaving it
+	// around invites a confused re-run.
+	if f.phase == phasePostDocker && f.stateFile != "" {
+		os.Remove(f.stateFile)
+	}
 	return nil
+}
+
+func saveState(path string, plan *mapper.Plan) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	buf, err := json.MarshalIndent(state{Version: stateVersion, Plan: plan}, "", "  ")
+	if err != nil {
+		return err
+	}
+	// Atomic write: rename is atomic on the same filesystem, so a crash
+	// mid-flush can't leave us with half a plan.
+	tmp := path + ".tmp"
+	if err = os.WriteFile(tmp, buf, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func loadState(path string) (*mapper.Plan, error) {
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var s state
+	if err = json.Unmarshal(buf, &s); err != nil {
+		return nil, err
+	}
+	if s.Version != stateVersion {
+		return nil, fmt.Errorf("state file version %d, want %d — rerun --phase=pre-docker", s.Version, stateVersion)
+	}
+	if s.Plan == nil {
+		return nil, fmt.Errorf("state file has no plan")
+	}
+	return s.Plan, nil
 }
 
 // insertAll runs the entire DB-write phase inside a single transaction. If

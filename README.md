@@ -1,10 +1,49 @@
 # coolfymigrater
 
 One-shot migration tool that hands a running Coolify v3 install over to
-coolifygo on the same host. Reads v3's SQLite database directly, decrypts its
-secrets with v3's `COOLIFY_SECRET_KEY`, inserts equivalent rows into
-coolifygo's Postgres, then takes over every workload container (apps + DBs)
-and finally wipes the v3 stack.
+**coolifygo** on the same host. Reads v3's SQLite database directly, decrypts
+its secrets with v3's `COOLIFY_SECRET_KEY`, inserts equivalent rows into
+coolifygo's Postgres, takes over every workload container (apps + DBs),
+upgrades the host Docker engine, and finally wipes the v3 stack.
+
+## Quickstart — one command
+
+On the v3 host:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/annihilatorrrr/coolifyv32Go/main/install.sh | sudo bash
+```
+
+That wrapper does the whole thing end to end:
+
+1. Installs Go if missing
+2. Installs coolifygo via `gocoolify/install.sh` (skipped if already running)
+3. `go install`s this migrater from source
+4. Runs `--phase=pre-docker` — discover, freeze v3, extract SQLite, decrypt, insert into coolifygo's Postgres
+5. **Upgrades the host's Docker engine** (always-on — v3 ships with an old version)
+6. Runs `--phase=post-docker` — takes over every v3 workload container, then wipes v3 completely
+
+No manual flags required — DSN + encryption key are sourced from `/data/coolifygo/.env`.
+
+## Manual run (without install.sh)
+
+```
+coolfymigrater \
+  --coolifygo-dsn=postgres://coolifygo:...@coolifygo-postgres:5432/coolifygo \
+  --coolifygo-key=$(grep DATA_ENCRYPTION_KEY /data/coolifygo/.env | cut -d= -f2)
+```
+
+Both flags fall back to `$DATABASE_URL` and `$DATA_ENCRYPTION_KEY` env vars.
+`--v3-secret-key` and `--v3-sqlite` are auto-detected from the running
+`coolify` container; pass them if discovery fails.
+
+| Flag | Purpose |
+|---|---|
+| `--phase` | `all` (default), `pre-docker` (stops after insert), or `post-docker` (resumes from state file). Used by `install.sh` to bracket the Docker upgrade. |
+| `--state-file` | Where `pre-docker` writes / `post-docker` reads the plan JSON (default `/var/lib/coolfymigrater/state.json`). |
+| `--dry-run` | Print the plan and exit. |
+| `--yes` | Skip confirmation prompts. |
+| `--no-teardown` | Keep v3 alive after data migration. |
 
 ## Scope
 
