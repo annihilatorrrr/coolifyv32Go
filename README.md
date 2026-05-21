@@ -17,11 +17,12 @@ curl -fsSL https://raw.githubusercontent.com/annihilatorrrr/coolifyv32Go/main/in
 That wrapper does the whole thing end to end:
 
 1. Installs Go if missing
-2. Installs coolifygo via `gocoolify/install.sh` (skipped if already running)
-3. `go install`s this migrater from source
-4. Runs `--phase=pre-docker` — discover, freeze v3, extract SQLite, decrypt, insert into coolifygo's Postgres
-5. **Upgrades the host's Docker engine** (always-on — v3 ships with an old version)
-6. Runs `--phase=post-docker` — takes over every v3 workload container, then wipes v3 completely
+2. `go install`s this migrater from source
+3. **Freezes v3** — stops `coolify` + `coolify-fluentbit`, releasing port 3000 and quiescing SQLite
+4. **Upgrades the host's Docker engine** (always-on — v3 ships with an old version; safe here because v3 is frozen and coolifygo isn't up yet)
+5. Installs coolifygo via `gocoolify/install.sh` (skipped if already running) — port 3000 is now free and Docker is modern
+6. Runs `--phase=pre-docker` — discover, extract SQLite, decrypt, plan, insert into coolifygo's Postgres
+7. Runs `--phase=post-docker` — takes over every v3 workload container, then wipes v3 completely
 
 No manual flags required — DSN + encryption key are sourced from `/data/coolifygo/.env`.
 
@@ -58,20 +59,6 @@ Built for the narrow shape the operator described:
 Everything else (services, FQDN/Traefik/SSL, teams, PR previews, remote
 destinations, Storages) is intentionally skipped.
 
-## How it runs
-
-```
-coolfymigrater \
-  --coolifygo-dsn=postgres://coolifygo:...@coolifygo-postgres:5432/coolifygo \
-  --coolifygo-key=$(cat /data/coolifygo/.env | grep DATA_ENCRYPTION_KEY | cut -d= -f2)
-```
-
-Both flags fall back to `$DATABASE_URL` and `$DATA_ENCRYPTION_KEY` env vars.
-`--v3-secret-key` and `--v3-sqlite` are auto-detected from the running
-`coolify` container; pass them if discovery fails. `--dry-run` prints the plan
-and exits. `--yes` skips confirmation prompts. `--no-teardown` keeps v3 alive
-on disk after the data migration.
-
 ## Phases
 
 1. **discover** — inspect the local `coolify` container for the secret key and
@@ -105,8 +92,8 @@ on disk after the data migration.
 | v3 entity              | coolifygo target          | Notes                                          |
 | ---------------------- | ------------------------- | ---------------------------------------------- |
 | `GithubApp` + `GitSource` | `git_sources`          | github-app auth_type only. PEM, client secret, webhook secret re-encrypted under coolifygo's AES-256-GCM. |
-| `Application` + `Secret` | `applications`         | env_vars carries decrypted secrets. Branch defaults to `main`, base_directory to `./`, dockerfile_location to `Dockerfile`. Status set to whatever the live v3 container reports. |
-| `Database`             | `databases`               | Slug regenerated. Volume content copied byte-for-byte. Port + internal_port set to the canonical 5432/6379. |
+| `Application` + `Secret` | `applications`         | env_vars carries decrypted secrets. Branch defaults to `main`, base_directory to `./`, dockerfile_location to `Dockerfile`. Status set to whatever the live v3 container reports. Host port carried from Docker's actual port bindings (not v3's internal port field, which was for Traefik routing). Apps with no host-published port get port 0 (no host binding). |
+| `Database`             | `databases`               | Slug regenerated. Volume content copied byte-for-byte. Port + internal_port set to the canonical 5432/6379. Public port carried from Docker's actual host binding (overrides v3 SQLite if they diverge). |
 | running container metadata | container_id / image_name on the new row | So the boot reconciler doesn't immediately try to recreate something that's already up. |
 
 ## What gets thrown away
@@ -120,6 +107,9 @@ on disk after the data migration.
 
 ## Safety
 
+- **Port conflict detection** at plan time: the migrater checks for duplicate
+  host ports within the migration batch and against resources already in
+  coolifygo's database. Bails with a descriptive error before any change.
 - Inserts run inside a single Postgres transaction. Rollback on any failure
   leaves coolifygo in its pre-migration state.
 - Container takeover begins only after the transaction commits. A failed

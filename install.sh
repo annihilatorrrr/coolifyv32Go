@@ -92,7 +92,7 @@ EOF
   ok "Go installed: $(go version)"
 }
 
-# ── Step 2: Docker presence ───────────────────────────────────────────────
+# ── Step 0: Docker presence ───────────────────────────────────────────────
 # Bail early on hosts that don't have Docker at all. v3 always installs
 # Docker, so its absence means this isn't a v3 host — operator should install
 # gocoolify directly instead of trying to "migrate" nothing.
@@ -121,7 +121,7 @@ freeze_v3() {
   fi
 }
 
-# ── Step 5: coolifygo ─────────────────────────────────────────────────────
+# ── Step 5: coolifygo install ─────────────────────────────────────────────
 ensure_coolifygo() {
   # Probe by container: gocoolify install.sh names it "coolifygo".
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx coolifygo; then
@@ -139,7 +139,7 @@ ensure_coolifygo() {
   ok "coolifygo installed"
 }
 
-# ── Step 1b: migrater binary (after Go, before any host-mutating step) ────
+# ── Step 2: migrater binary ───────────────────────────────────────────────
 ensure_migrater() {
   if have coolfymigrater; then
     ok "coolfymigrater already on PATH: $(command -v coolfymigrater)"
@@ -163,7 +163,7 @@ load_coolifygo_env() {
   ok "loaded coolifygo env from ${COOLIFYGO_ENV}"
 }
 
-# ── Step 5: pre-docker phase ──────────────────────────────────────────────
+# ── Step 7: pre-docker phase ──────────────────────────────────────────────
 run_pre_docker() {
   info "running coolfymigrater --phase=pre-docker"
   local yes_flag=""
@@ -173,11 +173,11 @@ run_pre_docker() {
   ok "data committed to coolifygo Postgres; state at ${STATE_FILE}"
 }
 
-# ── Step 6: Docker upgrade ────────────────────────────────────────────────
-# Always-on per the design — v3 ships with an old engine. Containers carrying
-# unless-stopped restart policy come back automatically after daemon restart;
-# the freeze in pre-docker left v3's management containers stopped, so they
-# stay down. coolifygo-postgres just committed; it's safe to bounce.
+# ── Step 4: Docker upgrade ────────────────────────────────────────────────
+# Always-on per the design — v3 ships with an old engine. Runs after freeze_v3
+# but before coolifygo install, so the daemon restart is safe: v3 management
+# containers are stopped (unless-stopped policy keeps them down), workload
+# containers bounce back via their restart policy, and coolifygo isn't up yet.
 upgrade_docker() {
   info "upgrading Docker engine"
   local pm
@@ -207,7 +207,7 @@ upgrade_docker() {
   ok "Docker now: $(docker --version)"
 }
 
-# ── Step 7: post-docker phase ─────────────────────────────────────────────
+# ── Step 8: post-docker phase ─────────────────────────────────────────────
 run_post_docker() {
   info "running coolfymigrater --phase=post-docker"
   local yes_flag=""
@@ -220,12 +220,14 @@ run_post_docker() {
 main() {
   need_root
   info "coolfymigrater install.sh — Coolify v3 → coolifygo on $(hostname)"
+  require_docker
   ensure_go
-  ensure_coolifygo
   ensure_migrater
+  freeze_v3
+  upgrade_docker
+  ensure_coolifygo
   load_coolifygo_env
   run_pre_docker
-  upgrade_docker
   run_post_docker
   ok "all done — Coolify v3 is gone, coolifygo owns the host"
 }

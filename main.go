@@ -259,6 +259,15 @@ func runPreDocker(ctx context.Context, f flags) (*mapper.Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	existingPorts, err := target.UsedPorts(ctx, localServer)
+	if err != nil {
+		return nil, fmt.Errorf("check existing ports: %w", err)
+	}
+	if err = plan.ValidatePortsAgainst(existingPorts); err != nil {
+		return nil, err
+	}
+
 	printPlan(plan)
 
 	if f.dryRun {

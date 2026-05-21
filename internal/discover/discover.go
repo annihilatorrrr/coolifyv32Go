@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
@@ -42,6 +43,7 @@ type V3Stack struct {
 // fallback on labels/env (v3 doesn't set as clean a label set as we'd like).
 type V3Workload struct {
 	Labels        map[string]string
+	PortBindings  map[int]int // host port → container port; populated from Docker HostConfig
 	ContainerID   string
 	ContainerName string
 	Image         string
@@ -137,6 +139,7 @@ func Inspect(ctx context.Context, dc *client.Client) (*V3Stack, error) {
 			Labels:        full.Config.Labels,
 			Running:       full.State != nil && full.State.Running,
 			Volumes:       full.Mounts,
+			PortBindings:  extractPortBindings(full.HostConfig),
 		}
 		for net := range full.NetworkSettings.Networks {
 			w.Networks = append(w.Networks, net)
@@ -199,6 +202,29 @@ func ExtractSQLite(ctx context.Context, dc *client.Client, coolifyID string) (st
 		f.Close()
 	}
 	return dst, nil
+}
+
+// extractPortBindings reads HostConfig.PortBindings and returns a map of
+// hostPort → containerPort for every published port.
+func extractPortBindings(hc *container.HostConfig) map[int]int {
+	if hc == nil || len(hc.PortBindings) == 0 {
+		return nil
+	}
+	out := make(map[int]int, len(hc.PortBindings))
+	for containerPort, bindings := range hc.PortBindings {
+		cp := containerPort.Int()
+		for _, b := range bindings {
+			hp, err := strconv.Atoi(b.HostPort)
+			if err != nil || hp == 0 {
+				continue
+			}
+			out[hp] = cp
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func stripSlash(names []string) string {

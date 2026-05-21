@@ -101,6 +101,45 @@ func (c *Client) FindLocalServer(ctx context.Context) (uuid.UUID, error) {
 	return id, nil
 }
 
+// UsedPorts returns every host port already claimed by apps and public
+// databases on the given server. Mirrors coolifygo's ports.Allocator.collectUsed
+// so the migrater can detect conflicts before inserting.
+func (c *Client) UsedPorts(ctx context.Context, serverID uuid.UUID) (map[int]string, error) {
+	used := make(map[int]string)
+
+	rows, err := c.Pool.Query(ctx,
+		`SELECT name, port FROM applications WHERE server_id = $1 AND port > 0`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("query app ports: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var port int
+		if err = rows.Scan(&name, &port); err != nil {
+			return nil, err
+		}
+		used[port] = fmt.Sprintf("existing app %q", name)
+	}
+
+	drows, err := c.Pool.Query(ctx,
+		`SELECT name, public_port FROM databases WHERE server_id = $1 AND is_public = true AND public_port > 0`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("query db ports: %w", err)
+	}
+	defer drows.Close()
+	for drows.Next() {
+		var name string
+		var port int
+		if err = drows.Scan(&name, &port); err != nil {
+			return nil, err
+		}
+		used[port] = fmt.Sprintf("existing database %q", name)
+	}
+
+	return used, nil
+}
+
 // AppRow is the minimal column set we insert into applications. Mirrors
 // coolifygo's CreateApplication call sig, keeping defaults for fields the
 // migrater doesn't carry over from v3.

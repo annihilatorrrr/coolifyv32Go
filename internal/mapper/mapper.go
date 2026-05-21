@@ -131,7 +131,7 @@ func BuildPlan(
 			GitRepo:            a.Repository,
 			Branch:             firstNonEmpty(a.Branch, "main"),
 			BuildPack:          "dockerfile",
-			Port:               a.Port,
+			Port:               0,
 			EnvVars:            a.Secrets,
 			IsBot:              a.IsBot,
 			AutoDeploy:         a.AutoDeploy,
@@ -147,6 +147,12 @@ func BuildPlan(
 			ap.Row.ImageName = w.Image
 			if !w.Running {
 				ap.Row.Status = "stopped"
+			}
+			// If v3 had this container exposed on a host port, carry it over.
+			// coolifygo's Port field = host binding, so we use the actual
+			// published host port from Docker, not v3's internal port field.
+			if hp := firstHostPort(w.PortBindings); hp > 0 {
+				ap.Row.Port = hp
 			}
 		} else {
 			ap.Row.Status = "stopped"
@@ -186,6 +192,12 @@ func BuildPlan(
 			if !w.Running {
 				dp.Row.Status = "stopped"
 			}
+			// Override public port from actual Docker host binding if present,
+			// in case v3's SQLite is stale or doesn't match reality.
+			if hp := firstHostPort(w.PortBindings); hp > 0 {
+				dp.Row.IsPublic = true
+				dp.Row.PublicPort = hp
+			}
 		} else {
 			dp.Row.Status = "stopped"
 			dp.Row.ContainerID = ""
@@ -193,7 +205,54 @@ func BuildPlan(
 		plan.Databases = append(plan.Databases, dp)
 	}
 
+	// Port conflict check: no two resources can bind the same host port.
+	// coolifygo's API enforces this at create/update time via ports.Allocator,
+	// but we bypass the API, so we must catch it here.
+	usedPorts := make(map[int]string) // port → resource name
+	for _, ap := range plan.Apps {
+		p := ap.Row.Port
+		if p == 0 {
+			continue
+		}
+		if owner, dup := usedPorts[p]; dup {
+			return nil, fmt.Errorf("port %d conflict: app %q and %s both bind the same host port", p, ap.Row.Name, owner)
+		}
+		usedPorts[p] = fmt.Sprintf("app %q", ap.Row.Name)
+	}
+	for _, dp := range plan.Databases {
+		if !dp.Row.IsPublic || dp.Row.PublicPort == 0 {
+			continue
+		}
+		p := dp.Row.PublicPort
+		if owner, dup := usedPorts[p]; dup {
+			return nil, fmt.Errorf("port %d conflict: database %q and %s both bind the same host port", p, dp.Row.Name, owner)
+		}
+		usedPorts[p] = fmt.Sprintf("database %q", dp.Row.Name)
+	}
+
 	return plan, nil
+}
+
+// ValidatePortsAgainst checks the plan's ports against an existing set of
+// used ports from coolifygo's database. Returns an error on first conflict.
+func (p *Plan) ValidatePortsAgainst(existing map[int]string) error {
+	for _, ap := range p.Apps {
+		if ap.Row.Port == 0 {
+			continue
+		}
+		if owner, dup := existing[ap.Row.Port]; dup {
+			return fmt.Errorf("port %d conflict: migrating app %q would collide with %s already in coolifygo", ap.Row.Port, ap.Row.Name, owner)
+		}
+	}
+	for _, dp := range p.Databases {
+		if !dp.Row.IsPublic || dp.Row.PublicPort == 0 {
+			continue
+		}
+		if owner, dup := existing[dp.Row.PublicPort]; dup {
+			return fmt.Errorf("port %d conflict: migrating database %q would collide with %s already in coolifygo", dp.Row.PublicPort, dp.Row.Name, owner)
+		}
+	}
+	return nil
 }
 
 // SetGitSourceID writes the inserted git_sources UUID back into every AppPlan
@@ -246,6 +305,15 @@ func safeShort(id string) string {
 		return id
 	}
 	return id[:8]
+}
+
+// firstHostPort returns the first host port from a workload's port bindings,
+// or 0 if none are published.
+func firstHostPort(bindings map[int]int) int {
+	for hp := range bindings {
+		return hp
+	}
+	return 0
 }
 
 func defaultPort(dbType string) int {
