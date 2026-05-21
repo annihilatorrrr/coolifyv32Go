@@ -7,11 +7,18 @@
 #
 # The wrapper:
 #   1. Installs Go (if missing) at /usr/local/go using the official tarball.
-#   2. Installs coolifygo via the gocoolify install.sh — skips if already up.
-#   3. `go install`s the coolfymigrater binary from this repo's main branch.
-#   4. Runs the binary `--phase=pre-docker` (discover → freeze → SQLite extract → insert).
-#   5. Upgrades the host Docker engine (always-on; v3 ships with an old version).
-#   6. Runs the binary `--phase=post-docker` (takeover → wipe v3).
+#   2. `go install`s the coolfymigrater binary from this repo's main branch.
+#   3. Freezes v3 (stops `coolify` + `coolify-fluentbit`) — releases :3000 so
+#      coolifygo can bind it, and quiesces SQLite for extraction.
+#   4. Upgrades the host Docker engine (always-on; v3 ships with an old version).
+#      Safe here because v3 is already frozen and coolifygo isn't installed yet,
+#      so the dockerd restart disrupts nothing live.
+#   5. Installs coolifygo via the gocoolify install.sh — skips if already up.
+#      gocoolify's installer only installs Docker if missing; never upgrades
+#      existing Docker. That's why step 4 has to happen here, not inside it.
+#   6. Runs the binary `--phase=pre-docker` (discover → idempotent re-freeze →
+#      SQLite extract → read → plan → insert into coolifygo's Postgres).
+#   7. Runs the binary `--phase=post-docker` (takeover → wipe v3).
 #
 # Idempotent on re-runs: each step probes for existing state before acting,
 # so a failed run can be re-launched without compounding damage.
@@ -85,7 +92,36 @@ EOF
   ok "Go installed: $(go version)"
 }
 
-# ── Step 2: coolifygo ─────────────────────────────────────────────────────
+# ── Step 2: Docker presence ───────────────────────────────────────────────
+# Bail early on hosts that don't have Docker at all. v3 always installs
+# Docker, so its absence means this isn't a v3 host — operator should install
+# gocoolify directly instead of trying to "migrate" nothing.
+require_docker() {
+  have docker || fail "docker not installed — this script is for hosts running Coolify v3. For a fresh install, run gocoolify's install.sh directly."
+  ok "docker present: $(docker --version 2>/dev/null || echo unknown)"
+}
+
+# ── Step 3: freeze v3 ─────────────────────────────────────────────────────
+# Stop v3's management containers before any further step. Three reasons:
+#   1. Releases TCP :3000 so coolifygo can bind it later.
+#   2. Quiesces SQLite (`/app/db/prod.db`) so the upcoming `docker cp` reads a
+#      consistent snapshot. docker cp itself works on stopped containers.
+#   3. Lets us safely upgrade Docker without v3 trying to write mid-restart.
+# Idempotent: if the containers are already stopped or missing, this is a no-op.
+freeze_v3() {
+  info "freezing v3 management plane"
+  local stopped=0
+  for name in coolify coolify-fluentbit; do
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"; then
+      docker stop -t 30 "$name" >/dev/null && { ok "stopped $name"; stopped=$((stopped+1)); }
+    fi
+  done
+  if [[ $stopped -eq 0 ]]; then
+    ok "no running v3 management containers (already frozen, or v3 not installed)"
+  fi
+}
+
+# ── Step 5: coolifygo ─────────────────────────────────────────────────────
 ensure_coolifygo() {
   # Probe by container: gocoolify install.sh names it "coolifygo".
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx coolifygo; then
@@ -103,7 +139,7 @@ ensure_coolifygo() {
   ok "coolifygo installed"
 }
 
-# ── Step 3: migrater binary ───────────────────────────────────────────────
+# ── Step 1b: migrater binary (after Go, before any host-mutating step) ────
 ensure_migrater() {
   if have coolfymigrater; then
     ok "coolfymigrater already on PATH: $(command -v coolfymigrater)"
@@ -115,7 +151,7 @@ ensure_migrater() {
   ok "coolfymigrater installed: $(command -v coolfymigrater)"
 }
 
-# ── Step 4: env from coolifygo ────────────────────────────────────────────
+# ── Step 6: env from coolifygo ────────────────────────────────────────────
 load_coolifygo_env() {
   [[ -r "${COOLIFYGO_ENV}" ]] || fail "${COOLIFYGO_ENV} not readable — is coolifygo provisioned?"
   set -a
