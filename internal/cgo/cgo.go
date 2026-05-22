@@ -121,6 +121,9 @@ func (c *Client) UsedPorts(ctx context.Context, serverID uuid.UUID) (map[int]str
 		}
 		used[port] = fmt.Sprintf("existing app %q", name)
 	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate app ports: %w", err)
+	}
 
 	drows, err := c.Pool.Query(ctx,
 		`SELECT name, public_port FROM databases WHERE server_id = $1 AND is_public = true AND public_port > 0`, serverID)
@@ -135,6 +138,9 @@ func (c *Client) UsedPorts(ctx context.Context, serverID uuid.UUID) (map[int]str
 			return nil, err
 		}
 		used[port] = fmt.Sprintf("existing database %q", name)
+	}
+	if err = drows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate db ports: %w", err)
 	}
 
 	return used, nil

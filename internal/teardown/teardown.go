@@ -10,7 +10,6 @@ package teardown
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -142,10 +141,6 @@ func removeImagesByPrefix(ctx context.Context, dc *client.Client, w io.Writer, p
 
 func removeNetwork(ctx context.Context, dc *client.Client, w io.Writer, name string) error {
 	if err := dc.NetworkRemove(ctx, name); err != nil {
-		if errors.Is(err, errNotFound) {
-			return nil
-		}
-		// Network may already be gone — accept "not found" responses by string match.
 		if strings.Contains(strings.ToLower(err.Error()), "not found") {
 			return nil
 		}
@@ -154,5 +149,3 @@ func removeNetwork(ctx context.Context, dc *client.Client, w io.Writer, name str
 	fmt.Fprintf(w, "  remove network %s\n", name)
 	return nil
 }
-
-var errNotFound = errors.New("not found")

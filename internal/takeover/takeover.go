@@ -250,7 +250,8 @@ func WaitHealthy(ctx context.Context, dc *client.Client, containerID string, tim
 }
 
 func stopAndRemove(ctx context.Context, dc *client.Client, id string) error {
-	_ = dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
+	timeout := 30
+	dc.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
 	return dc.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
 }
 
@@ -288,14 +289,14 @@ func copyVolume(ctx context.Context, dc *client.Client, srcVol, newVol string) e
 	if err = dc.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("start copy container: %w", err)
 	}
-	wait, errCh := dc.ContainerWait(ctx, resp.ID, container.WaitConditionRemoved)
+	waitCh, errCh := dc.ContainerWait(ctx, resp.ID, container.WaitConditionRemoved)
 	select {
-	case <-wait:
+	case result := <-waitCh:
+		if result.StatusCode != 0 {
+			return fmt.Errorf("volume copy exited with status %d", result.StatusCode)
+		}
 		return nil
 	case err = <-errCh:
-		if err == nil {
-			return nil
-		}
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
