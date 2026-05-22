@@ -65,23 +65,34 @@ detect_pkg_mgr() {
 }
 
 # ── Step 1: Go ────────────────────────────────────────────────────────────
+GO_PREEXISTED=0        # 1 = Go was already on the host before we touched it
+GO_OLD_VERSION=""      # stash the original version string for the log
+
 ensure_go() {
-  if have go && go version | grep -qE "go${GO_VERSION//./\\.}"; then
-    ok "Go ${GO_VERSION} already installed: $(go version)"
-    return
-  fi
-  info "installing Go ${GO_VERSION}"
   local arch tarball url
   arch=$(detect_arch)
   tarball="go${GO_VERSION}.linux-${arch}.tar.gz"
   url="https://go.dev/dl/${tarball}"
+
+  if have go; then
+    GO_OLD_VERSION="$(go version | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?')"
+    if go version | grep -qE "go${GO_VERSION//./\\.}"; then
+      ok "Go ${GO_VERSION} already installed: $(go version)"
+      GO_PREEXISTED=1
+      return
+    fi
+    GO_PREEXISTED=1
+    info "upgrading Go from ${GO_OLD_VERSION} → ${GO_VERSION}"
+  else
+    GO_PREEXISTED=0
+    info "installing Go ${GO_VERSION} (fresh)"
+  fi
 
   rm -rf "${GO_INSTALL_DIR}"
   curl -fsSL --retry 3 -o "/tmp/${tarball}" "${url}"
   tar -C "$(dirname "${GO_INSTALL_DIR}")" -xzf "/tmp/${tarball}"
   rm -f "/tmp/${tarball}"
 
-  # Persist PATH for future shells; export for the current run.
   if ! grep -q "${GO_INSTALL_DIR}/bin" /etc/profile.d/go.sh 2>/dev/null; then
     cat > /etc/profile.d/go.sh <<EOF
 export PATH=\$PATH:${GO_INSTALL_DIR}/bin:\$HOME/go/bin
@@ -90,6 +101,21 @@ EOF
   fi
   export PATH="${PATH}:${GO_INSTALL_DIR}/bin:${HOME}/go/bin"
   ok "Go installed: $(go version)"
+}
+
+# Called at the end of main — removes Go that we installed/upgraded.
+cleanup_go() {
+  if [[ "${GO_PREEXISTED}" -eq 0 ]]; then
+    info "removing Go (was not present before migration)"
+    rm -rf "${GO_INSTALL_DIR}"
+    rm -f /etc/profile.d/go.sh
+    ok "Go removed"
+  else
+    info "removing Go ${GO_VERSION} that we upgraded to (was ${GO_OLD_VERSION} before)"
+    rm -rf "${GO_INSTALL_DIR}"
+    rm -f /etc/profile.d/go.sh
+    ok "Go removed — reinstall your previous version if needed"
+  fi
 }
 
 # ── Step 0: Docker presence ───────────────────────────────────────────────
@@ -229,6 +255,7 @@ main() {
   load_coolifygo_env
   run_pre_docker
   run_post_docker
+  cleanup_go
   ok "all done — Coolify v3 is gone, coolifygo owns the host"
 }
 
