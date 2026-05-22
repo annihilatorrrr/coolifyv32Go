@@ -142,8 +142,7 @@ func BuildPlan(
 		}
 		ap := AppPlan{V3App: a, Row: row, V3SrcID: a.GitSourceID}
 		if w, ok := workloadByV3ID[a.ID]; ok {
-			wCopy := w
-			ap.Workload = &wCopy
+			ap.Workload = new(w)
 			ap.Row.ContainerID = w.ContainerID
 			ap.Row.ImageName = w.Image
 			if !w.Running {
@@ -188,8 +187,7 @@ func BuildPlan(
 		}
 		dp := DBPlan{V3DB: d, Row: row}
 		if w, ok := workloadByV3ID[d.ID]; ok {
-			wCopy := w
-			dp.Workload = &wCopy
+			dp.Workload = new(w)
 			dp.Row.ContainerID = w.ContainerID
 			if !w.Running {
 				dp.Row.Status = "stopped"

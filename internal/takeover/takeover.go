@@ -250,8 +250,7 @@ func WaitHealthy(ctx context.Context, dc *client.Client, containerID string, tim
 }
 
 func stopAndRemove(ctx context.Context, dc *client.Client, id string) error {
-	timeout := 30
-	dc.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
+	_ = dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
 	return dc.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
 }
 

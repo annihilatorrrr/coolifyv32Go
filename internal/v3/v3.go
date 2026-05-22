@@ -2,7 +2,7 @@
 //
 // v3 stores its data in /app/db/prod.db inside the `coolify` container (volume
 // `coolify-db`). Secrets are sealed with AES-256-CTR keyed by the
-// COOLIFY_SECRET_KEY env var, serialised as JSON {iv, content} in hex.
+// COOLIFY_SECRET_KEY env var, serialized as JSON {iv, content} in hex.
 package v3
 
 import (
@@ -105,7 +105,7 @@ func Open(dbPath, secretKey string) (*Client, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	if err = db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("sqlite ping: %w", err)
 	}
 	return &Client{db: db, secretKey: []byte(secretKey)}, nil
@@ -115,7 +115,7 @@ func Open(dbPath, secretKey string) (*Client, error) {
 func (c *Client) Close() error { return c.db.Close() }
 
 // Decrypt unseals a v3 ciphertext. v3 stores the empty string for unset secrets
-// — we mirror that behaviour and return "" for empty input.
+// — we mirror that behavior and return "" for empty input.
 func (c *Client) Decrypt(stored string) (string, error) {
 	if stored == "" {
 		return "", nil

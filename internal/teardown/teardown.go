@@ -4,7 +4,7 @@
 // prunes the coollabsio images, and tears down the coolify-infra network.
 //
 // User app/DB volumes are NEVER touched here — those have already been copied
-// (databases) or relabelled (apps) by the takeover phase, and ownership of
+// (databases) or relabeled (apps) by the takeover phase, and ownership of
 // any leftover bind mounts belongs to the user.
 package teardown
 
@@ -42,7 +42,7 @@ var V3Containers = []string{
 	"coolify-haproxy",
 }
 
-// HostPaths lists v3 install artefacts on the host filesystem. Removed last,
+// HostPaths lists v3 install artifacts on the host filesystem. Removed last,
 // after the docker objects, so a partial failure earlier leaves the host
 // state intact and re-runnable.
 var HostPaths = []string{
@@ -60,9 +60,8 @@ func Wipe(ctx context.Context, dc *client.Client, w io.Writer) error {
 
 	for _, name := range V3Containers {
 		if id, err := containerByName(ctx, dc, name); err == nil && id != "" {
-			fmt.Fprintf(w, "  stop+remove %s\n", name)
-			timeout := 30
-			dc.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
+			_, _ = fmt.Fprintf(w, "  stop+remove %s\n", name)
+			_ = dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
 			if err = dc.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: false}); err != nil {
 				nonFatal = append(nonFatal, fmt.Sprintf("remove %s: %s", name, err))
 			}
@@ -71,7 +70,7 @@ func Wipe(ctx context.Context, dc *client.Client, w io.Writer) error {
 
 	for _, vol := range V3Volumes {
 		if _, err := dc.VolumeInspect(ctx, vol); err == nil {
-			fmt.Fprintf(w, "  remove volume %s\n", vol)
+			_, _ = fmt.Fprintf(w, "  remove volume %s\n", vol)
 			if err = dc.VolumeRemove(ctx, vol, true); err != nil {
 				nonFatal = append(nonFatal, fmt.Sprintf("remove volume %s: %s", vol, err))
 			}
@@ -94,7 +93,7 @@ func Wipe(ctx context.Context, dc *client.Client, w io.Writer) error {
 
 	for _, p := range HostPaths {
 		if _, err := os.Stat(p); err == nil {
-			fmt.Fprintf(w, "  remove host path %s\n", p)
+			_, _ = fmt.Fprintf(w, "  remove host path %s\n", p)
 			if err = os.RemoveAll(p); err != nil {
 				nonFatal = append(nonFatal, fmt.Sprintf("remove %s: %s", p, err))
 			}
@@ -128,7 +127,7 @@ func removeImagesByPrefix(ctx context.Context, dc *client.Client, w io.Writer, p
 	for _, img := range imgs {
 		for _, tag := range img.RepoTags {
 			if strings.HasPrefix(tag, prefix) {
-				fmt.Fprintf(w, "  remove image %s\n", tag)
+				_, _ = fmt.Fprintf(w, "  remove image %s\n", tag)
 				if _, rerr := dc.ImageRemove(ctx, img.ID, image.RemoveOptions{Force: true, PruneChildren: true}); rerr != nil {
 					return fmt.Errorf("remove image %s: %w", tag, rerr)
 				}
@@ -146,6 +145,6 @@ func removeNetwork(ctx context.Context, dc *client.Client, w io.Writer, name str
 		}
 		return fmt.Errorf("remove network %s: %w", name, err)
 	}
-	fmt.Fprintf(w, "  remove network %s\n", name)
+	_, _ = fmt.Fprintf(w, "  remove network %s\n", name)
 	return nil
 }

@@ -211,7 +211,7 @@ func runPreDocker(ctx context.Context, f flags) (*mapper.Plan, error) {
 		}
 	}
 	if stack.FluentBitID != "" {
-		stopContainer(ctx, dc, stack.FluentBitID)
+		_ = stopContainer(ctx, dc, stack.FluentBitID)
 		clilog.OK("stopped coolify-fluentbit")
 	}
 
@@ -333,11 +333,11 @@ func runTakeoverAndTeardown(ctx context.Context, f flags, plan *mapper.Plan) err
 		clilog.Warn("%s", err)
 	}
 
-	// State file was a hand-off artefact between phases. Once we've taken
+	// State file was a hand-off artifact between phases. Once we've taken
 	// over + torn down, nothing should ever read it again, and leaving it
 	// around invites a confused re-run.
 	if f.phase == phasePostDocker && f.stateFile != "" {
-		os.Remove(f.stateFile)
+		_ = os.Remove(f.stateFile)
 	}
 	return nil
 }
@@ -524,8 +524,7 @@ func printPlan(plan *mapper.Plan) {
 }
 
 func stopContainer(ctx context.Context, dc *client.Client, id string) error {
-	timeout := 30
-	return dc.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
+	return dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
 }
 
 func short(id string) string {

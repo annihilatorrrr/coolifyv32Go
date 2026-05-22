@@ -78,7 +78,7 @@ func Inspect(ctx context.Context, dc *client.Client) (*V3Stack, error) {
 		}
 	}
 	if stack.CoolifyContainerID == "" {
-		return nil, errors.New("no `coolify` container found — is v3 installed on this host?")
+		return nil, errors.New("no `coolify` container found — is v3 installed on this host")
 	}
 
 	insp, err := dc.ContainerInspect(ctx, stack.CoolifyContainerID)
@@ -196,10 +196,10 @@ func ExtractSQLite(ctx context.Context, dc *client.Client, coolifyID string) (st
 			return "", ferr
 		}
 		if _, terr = io.Copy(f, tr); terr != nil {
-			f.Close()
+			_ = f.Close()
 			return "", terr
 		}
-		f.Close()
+		_ = f.Close()
 	}
 	return dst, nil
 }

@@ -7,7 +7,6 @@ package clilog
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 )
@@ -60,10 +59,4 @@ func Confirm(prompt string, assumeYes bool) bool {
 	}
 	answer := strings.ToLower(strings.TrimSpace(line))
 	return answer == "y" || answer == "yes"
-}
-
-// Section writes a horizontal rule to the given writer — used between
-// sub-blocks of teardown output where Phase would be too loud.
-func Section(w io.Writer, label string) {
-	fmt.Fprintf(w, "\n--- %s ---\n", label)
 }
