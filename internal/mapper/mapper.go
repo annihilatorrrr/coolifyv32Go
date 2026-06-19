@@ -307,13 +307,17 @@ func safeShort(id string) string {
 	return id[:8]
 }
 
-// firstHostPort returns the first host port from a workload's port bindings,
-// or 0 if none are published.
+// firstHostPort returns the lowest host port from a workload's port bindings,
+// or 0 if none are published. Deterministic so dry-run plans don't shuffle
+// across invocations when a container has multiple published ports.
 func firstHostPort(bindings map[int]int) int {
+	lowest := 0
 	for hp := range bindings {
-		return hp
+		if lowest == 0 || hp < lowest {
+			lowest = hp
+		}
 	}
-	return 0
+	return lowest
 }
 
 func defaultPort(dbType string) int {

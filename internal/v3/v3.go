@@ -30,7 +30,6 @@ type Application struct {
 	BaseDirectory      string
 	DockerFileLocation string
 	GitSourceID        string
-	DestinationID      string
 	Port               int
 	AutoDeploy         bool
 	IsBot              bool
@@ -49,7 +48,6 @@ type Database struct {
 	DBUserPassword   string // plaintext after decryption
 	RootUser         string
 	RootUserPassword string // plaintext after decryption
-	DestinationID    string
 	PublicPort       int
 	AppendOnly       bool // Redis AOF; carried from v3 DatabaseSettings, meaningless for non-Redis
 }
@@ -75,16 +73,6 @@ type GitSource struct {
 	HTMLURL      string
 	Organization string
 	GitHubAppID  string
-}
-
-// Destination mirrors v3's `DestinationDocker` row. We only migrate the local
-// one — remote destinations are out of scope per the user's brief.
-type Destination struct {
-	ID           string
-	Name         string
-	Network      string
-	Engine       string
-	RemoteEngine bool
 }
 
 // Client reads from an opened v3 SQLite file. Cheap to create; close when done.
@@ -158,7 +146,6 @@ func (c *Client) Applications() ([]Application, error) {
 		       COALESCE(a.baseDirectory, ''),
 		       COALESCE(a.dockerFileLocation, ''),
 		       COALESCE(a.gitSourceId, ''),
-		       COALESCE(a.destinationDockerId, ''),
 		       COALESCE(s.autodeploy, 1),
 		       COALESCE(s.isBot, 0)
 		FROM Application a
@@ -173,7 +160,7 @@ func (c *Client) Applications() ([]Application, error) {
 		var a Application
 		if err = rows.Scan(&a.ID, &a.Name, &a.Repository, &a.Branch,
 			&a.BuildPack, &a.Port, &a.BaseDirectory, &a.DockerFileLocation,
-			&a.GitSourceID, &a.DestinationID, &a.AutoDeploy, &a.IsBot); err != nil {
+			&a.GitSourceID, &a.AutoDeploy, &a.IsBot); err != nil {
 			return nil, fmt.Errorf("scan application: %w", err)
 		}
 		secrets, serr := c.appSecrets(a.ID)
@@ -222,7 +209,6 @@ func (c *Client) Databases() ([]Database, error) {
 		       COALESCE(d.dbUser, ''), COALESCE(d.dbUserPassword, ''),
 		       COALESCE(d.rootUser, ''), COALESCE(d.rootUserPassword, ''),
 		       COALESCE(d.publicPort, 0),
-		       COALESCE(d.destinationDockerId, ''),
 		       COALESCE(s.appendOnly, 1)
 		FROM Database d
 		LEFT JOIN DatabaseSettings s ON s.databaseId = d.id
@@ -238,7 +224,7 @@ func (c *Client) Databases() ([]Database, error) {
 		var aofInt int // sqlite stores BOOLEAN as 0/1
 		if err = rows.Scan(&d.ID, &d.Name, &d.Type, &d.Version,
 			&d.DefaultDatabase, &d.DBUser, &dbPw, &d.RootUser, &rootPw,
-			&d.PublicPort, &d.DestinationID, &aofInt); err != nil {
+			&d.PublicPort, &aofInt); err != nil {
 			return nil, fmt.Errorf("scan database: %w", err)
 		}
 		d.AppendOnly = aofInt != 0
@@ -315,25 +301,3 @@ func (c *Client) GitSources() ([]GitSource, error) {
 	return out, rows.Err()
 }
 
-// Destinations returns all v3 destinations. Only local ones get migrated.
-func (c *Client) Destinations() ([]Destination, error) {
-	rows, err := c.db.Query(`
-		SELECT id, name,
-		       COALESCE(network, ''),
-		       COALESCE(engine, ''),
-		       COALESCE(remoteEngine, 0)
-		FROM DestinationDocker`)
-	if err != nil {
-		return nil, fmt.Errorf("select destinations: %w", err)
-	}
-	defer rows.Close()
-	var out []Destination
-	for rows.Next() {
-		var d Destination
-		if err = rows.Scan(&d.ID, &d.Name, &d.Network, &d.Engine, &d.RemoteEngine); err != nil {
-			return nil, fmt.Errorf("scan destination: %w", err)
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
-}

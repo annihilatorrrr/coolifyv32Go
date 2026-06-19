@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
@@ -230,14 +231,19 @@ func WaitHealthy(ctx context.Context, dc *client.Client, containerID string, tim
 		if err != nil {
 			return err
 		}
-		if info.State.Dead || info.State.OOMKilled {
-			return fmt.Errorf("container exited: %s", info.State.Error)
+		// "exited" is the common terminal state when the entrypoint dies
+		// (bad password, missing config, etc); Dead/OOMKilled are rarer
+		// edge cases. Without "exited" here we'd poll until the timeout.
+		st := info.State
+		if st.Dead || st.OOMKilled || st.Status == "exited" {
+			return fmt.Errorf("container exited (status=%s, exit=%d): %s",
+				st.Status, st.ExitCode, st.Error)
 		}
-		if info.State.Running {
-			if info.State.Health == nil {
+		if st.Running {
+			if st.Health == nil {
 				return nil // no healthcheck configured
 			}
-			if info.State.Health.Status == "healthy" {
+			if st.Health.Status == "healthy" {
 				return nil
 			}
 		}
@@ -249,9 +255,14 @@ func WaitHealthy(ctx context.Context, dc *client.Client, containerID string, tim
 	}
 }
 
+// stopAndRemove tolerates "not found" so a post-docker re-run after a partial
+// takeover doesn't blow up on containers we already removed last time.
 func stopAndRemove(ctx context.Context, dc *client.Client, id string) error {
 	_ = dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
-	return dc.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
+	if err := dc.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+		return err
+	}
+	return nil
 }
 
 // copyVolume copies the contents of srcVol into newVol via a one-shot alpine
@@ -400,8 +411,11 @@ func dbEnv(in DBPlanInput) (env []string, cmd []string) {
 func dbHealthcheck(dbType string) *container.HealthConfig {
 	switch dbType {
 	case "postgresql":
+		// `-d postgres` pins the probe to the maintenance DB so libpq doesn't
+		// fall back to PGDATABASE=PGUSER (which only exists if the user named
+		// their default DB after the role). Matches coolifygo's dbHealthcheck.
 		return &container.HealthConfig{
-			Test:        []string{"CMD-SHELL", "pg_isready -h 127.0.0.1 -q"},
+			Test:        []string{"CMD-SHELL", "pg_isready -h 127.0.0.1 -q -d postgres"},
 			Interval:    5 * time.Second,
 			Retries:     3,
 			StartPeriod: 30 * time.Second,

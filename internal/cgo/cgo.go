@@ -169,9 +169,8 @@ type AppRow struct {
 }
 
 // InsertApplication inserts a single application row, returning its new UUID.
-// Wraps the encrypted env-vars as JSONB. build_args carries the git source
-// pointer when present, matching the convention in coolifygo's gitsources
-// handler (__git_source__ key under build_args).
+// Wraps the encrypted env-vars as JSONB. git_source_id is a real FK column on
+// applications; nil when the v3 app had no GitHub App attached.
 func (c *Client) InsertApplication(ctx context.Context, tx pgx.Tx, a AppRow) (uuid.UUID, error) {
 	envJSON, err := json.Marshal(a.EnvVars)
 	if err != nil {
@@ -180,29 +179,32 @@ func (c *Client) InsertApplication(ctx context.Context, tx pgx.Tx, a AppRow) (uu
 	if a.EnvVars == nil {
 		envJSON = []byte("{}")
 	}
-	buildArgs := map[string]string{}
+
+	var gitSourceArg any
 	if a.GitSourceID != "" {
-		buildArgs["__git_source__"] = a.GitSourceID
-	}
-	argsJSON, err := json.Marshal(buildArgs)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("build_args: %w", err)
+		gsID, perr := uuid.Parse(a.GitSourceID)
+		if perr != nil {
+			return uuid.Nil, fmt.Errorf("git_source_id %q: %w", a.GitSourceID, perr)
+		}
+		gitSourceArg = gsID
 	}
 
 	var id uuid.UUID
 	err = tx.QueryRow(ctx, `
 		INSERT INTO applications (
 			server_id, name, git_repo, branch, build_pack, port,
-			env_vars, build_args, is_bot, auto_deploy,
+			env_vars, is_bot, auto_deploy,
 			base_directory, dockerfile_location,
-			status, container_id, image_name, webhook_secret, source_type
+			status, container_id, image_name, webhook_secret,
+			source_type, git_source_id
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'git')
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'git',$16)
 		RETURNING id`,
 		a.ServerID, a.Name, a.GitRepo, a.Branch, a.BuildPack, a.Port,
-		envJSON, argsJSON, a.IsBot, a.AutoDeploy,
+		envJSON, a.IsBot, a.AutoDeploy,
 		a.BaseDirectory, a.DockerfileLocation,
 		a.Status, a.ContainerID, a.ImageName, a.WebhookSecret,
+		gitSourceArg,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("insert application: %w", err)

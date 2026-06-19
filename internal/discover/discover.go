@@ -20,7 +20,6 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 )
 
@@ -29,12 +28,8 @@ type V3Stack struct {
 	CoolifyContainerID string
 	FluentBitID        string
 	TraefikID          string
-	SQLitePath         string // local filesystem; caller must remove when done
 	SecretKey          string // raw COOLIFY_SECRET_KEY from coolify env
-	NetworkID          string // coolify-infra
-	NetworkName        string
 	WorkloadContainers []V3Workload
-	Volumes            []string // v3-stack volumes (coolify-db, coolify-logs, ...)
 }
 
 // V3Workload is a single user-owned container managed by v3 — either an app
@@ -99,17 +94,6 @@ func Inspect(ctx context.Context, dc *client.Client) (*V3Stack, error) {
 		return nil, errors.New("COOLIFY_SECRET_KEY not found in coolify container env — supply --v3-secret-key")
 	}
 
-	// Network — v3 calls it coolify-infra. Cache the id so teardown can remove it.
-	nets, err := dc.NetworkList(ctx, network.ListOptions{})
-	if err == nil {
-		for _, n := range nets {
-			if n.Name == "coolify-infra" {
-				stack.NetworkID = n.ID
-				stack.NetworkName = n.Name
-			}
-		}
-	}
-
 	// All workload containers — every container connected to coolify-infra
 	// that isn't part of v3's own stack is a user workload.
 	wargs := filters.NewArgs()
@@ -145,19 +129,6 @@ func Inspect(ctx context.Context, dc *client.Client) (*V3Stack, error) {
 			w.Networks = append(w.Networks, net)
 		}
 		stack.WorkloadContainers = append(stack.WorkloadContainers, w)
-	}
-
-	// Volumes — v3 docker-compose names six (coolify-db, coolify-logs,
-	// coolify-local-backup, coolify-ssl-certs, coolify-traefik-letsencrypt,
-	// coolify-letsencrypt, optionally coolify-pgdb).
-	for _, name := range []string{
-		"coolify-db", "coolify-logs", "coolify-local-backup",
-		"coolify-ssl-certs", "coolify-traefik-letsencrypt", "coolify-letsencrypt",
-		"coolify-pgdb",
-	} {
-		if _, vErr := dc.VolumeInspect(ctx, name); vErr == nil {
-			stack.Volumes = append(stack.Volumes, name)
-		}
 	}
 
 	return stack, nil
