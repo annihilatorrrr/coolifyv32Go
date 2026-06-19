@@ -120,7 +120,13 @@ destinations, Storages) is intentionally skipped.
 
 ## Re-runs
 
-The migrater is idempotent on names: applications, databases, and GitHub Apps
-that already exist in coolifygo are skipped. Container takeover is safe to
-re-run because new container creation removes any prior `coolifygo-…` with
-the same name first.
+- **Post-docker phase** can be resumed from the saved state file
+  (`/var/lib/coolfymigrater/state.json` by default). `stopAndRemove` tolerates
+  containers that were already cleaned up on a prior attempt, so an interrupted
+  takeover can be picked up where it left off.
+- **Pre-docker phase** is **not** idempotent — coolifygo's schema has no
+  unique constraint on names, so re-inserting would create duplicate rows.
+  Drop coolifygo's database (greenfield design) before re-running pre-docker
+  from scratch.
+- A fully successful post-docker run deletes the state file so a stale resume
+  can't confuse a future invocation.
