@@ -53,15 +53,16 @@ var HostPaths = []string{
 }
 
 // Wipe performs the full v3 teardown. Caller has already confirmed (no
-// prompting here). Returns a multi-error of non-fatal issues that didn't
-// block the overall wipe.
-func Wipe(ctx context.Context, dc *client.Client, w io.Writer) error {
+// prompting here). sourceVols carries the original v3 database volumes that
+// takeover copied into fresh coolifygo-db-<id8> volumes — see reclaimSourceVolumes.
+// Returns a multi-error of non-fatal issues that didn't block the overall wipe.
+func Wipe(ctx context.Context, dc *client.Client, w io.Writer, sourceVols []string) error {
 	var nonFatal []string
 
 	for _, name := range V3Containers {
 		if id, err := containerByName(ctx, dc, name); err == nil && id != "" {
-			_, _ = fmt.Fprintf(w, "  stop+remove %s\n", name)
-			_ = dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
+			fmt.Fprintf(w, "  stop+remove %s\n", name)
+			dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
 			if err = dc.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: false}); err != nil {
 				nonFatal = append(nonFatal, fmt.Sprintf("remove %s: %s", name, err))
 			}
@@ -70,12 +71,14 @@ func Wipe(ctx context.Context, dc *client.Client, w io.Writer) error {
 
 	for _, vol := range V3Volumes {
 		if _, err := dc.VolumeInspect(ctx, vol); err == nil {
-			_, _ = fmt.Fprintf(w, "  remove volume %s\n", vol)
+			fmt.Fprintf(w, "  remove volume %s\n", vol)
 			if err = dc.VolumeRemove(ctx, vol, true); err != nil {
 				nonFatal = append(nonFatal, fmt.Sprintf("remove volume %s: %s", vol, err))
 			}
 		}
 	}
+
+	nonFatal = append(nonFatal, reclaimSourceVolumes(ctx, dc, w, sourceVols)...)
 
 	if err := removeImagesByPrefix(ctx, dc, w, "coollabsio/coolify"); err != nil {
 		nonFatal = append(nonFatal, err.Error())
@@ -87,13 +90,22 @@ func Wipe(ctx context.Context, dc *client.Client, w io.Writer) error {
 		nonFatal = append(nonFatal, err.Error())
 	}
 
+	// alpine:3 is the one image the migrater itself pulls (the volume-copy
+	// helper base). Drop it too so nothing we introduced lingers — but only when
+	// unused: Force=false makes Docker refuse if any container still references
+	// it, so a user workload built on alpine:3 is never yanked out from under
+	// them. It re-pulls on demand if a later run needs it again.
+	if err := removeImageIfUnused(ctx, dc, w, "alpine:3"); err != nil {
+		nonFatal = append(nonFatal, err.Error())
+	}
+
 	if err := removeNetwork(ctx, dc, w, "coolify-infra"); err != nil {
 		nonFatal = append(nonFatal, err.Error())
 	}
 
 	for _, p := range HostPaths {
 		if _, err := os.Stat(p); err == nil {
-			_, _ = fmt.Fprintf(w, "  remove host path %s\n", p)
+			fmt.Fprintf(w, "  remove host path %s\n", p)
 			if err = os.RemoveAll(p); err != nil {
 				nonFatal = append(nonFatal, fmt.Sprintf("remove %s: %s", p, err))
 			}
@@ -104,6 +116,36 @@ func Wipe(ctx context.Context, dc *client.Client, w io.Writer) error {
 		return fmt.Errorf("teardown finished with warnings:\n  - %s", strings.Join(nonFatal, "\n  - "))
 	}
 	return nil
+}
+
+// reclaimSourceVolumes removes the original v3 database volumes that takeover
+// copied FROM (it copies rather than moves, so the source lingers). Every guard
+// here is deliberate so we can never destroy the wrong data:
+//   - skip empty names and anything coolifygo-owned (never touch a copy target
+//     or any coolifygo-managed volume),
+//   - dedupe so the same volume isn't attempted twice,
+//   - inspect-before-remove, so an already-gone volume is a silent no-op
+//     (keeps the post-docker re-run model intact),
+//   - force=false so Docker refuses to remove a volume still mounted by any
+//     container — the v3 DB container is already gone by this point, but if
+//     anything still holds the volume we leave it alone and report it.
+func reclaimSourceVolumes(ctx context.Context, dc *client.Client, w io.Writer, sourceVols []string) []string {
+	var nonFatal []string
+	seen := make(map[string]bool, len(sourceVols))
+	for _, vol := range sourceVols {
+		if vol == "" || strings.HasPrefix(vol, "coolifygo-") || seen[vol] {
+			continue
+		}
+		seen[vol] = true
+		if _, err := dc.VolumeInspect(ctx, vol); err != nil {
+			continue // already removed, or never existed
+		}
+		fmt.Fprintf(w, "  remove v3 source volume %s\n", vol)
+		if err := dc.VolumeRemove(ctx, vol, false); err != nil {
+			nonFatal = append(nonFatal, fmt.Sprintf("remove source volume %s (still in use?): %s", vol, err))
+		}
+	}
+	return nonFatal
 }
 
 func containerByName(ctx context.Context, dc *client.Client, name string) (string, error) {
@@ -127,13 +169,27 @@ func removeImagesByPrefix(ctx context.Context, dc *client.Client, w io.Writer, p
 	for _, img := range imgs {
 		for _, tag := range img.RepoTags {
 			if strings.HasPrefix(tag, prefix) {
-				_, _ = fmt.Fprintf(w, "  remove image %s\n", tag)
+				fmt.Fprintf(w, "  remove image %s\n", tag)
 				if _, rerr := dc.ImageRemove(ctx, img.ID, image.RemoveOptions{Force: true, PruneChildren: true}); rerr != nil {
 					return fmt.Errorf("remove image %s: %w", tag, rerr)
 				}
 				break
 			}
 		}
+	}
+	return nil
+}
+
+// removeImageIfUnused drops a single image by ref with Force=false, so Docker
+// refuses (and we report non-fatally) when any container still references it.
+// Absent image is a silent no-op. Used for alpine:3, the migrater's copy helper.
+func removeImageIfUnused(ctx context.Context, dc *client.Client, w io.Writer, ref string) error {
+	if _, err := dc.ImageInspect(ctx, ref); err != nil {
+		return nil // not present — nothing to remove
+	}
+	fmt.Fprintf(w, "  remove image %s\n", ref)
+	if _, err := dc.ImageRemove(ctx, ref, image.RemoveOptions{Force: false, PruneChildren: true}); err != nil {
+		return fmt.Errorf("remove image %s (in use — kept): %w", ref, err)
 	}
 	return nil
 }
@@ -145,6 +201,6 @@ func removeNetwork(ctx context.Context, dc *client.Client, w io.Writer, name str
 		}
 		return fmt.Errorf("remove network %s: %w", name, err)
 	}
-	_, _ = fmt.Fprintf(w, "  remove network %s\n", name)
+	fmt.Fprintf(w, "  remove network %s\n", name)
 	return nil
 }

@@ -167,10 +167,10 @@ func ExtractSQLite(ctx context.Context, dc *client.Client, coolifyID string) (st
 			return "", ferr
 		}
 		if _, terr = io.Copy(f, tr); terr != nil {
-			_ = f.Close()
+			f.Close()
 			return "", terr
 		}
-		_ = f.Close()
+		f.Close()
 	}
 	return dst, nil
 }

@@ -357,6 +357,6 @@ func randomHex(n int) (string, error) {
 // Database.Slug convention (handle used in connection strings / env vars).
 func randomSlug() string {
 	b := make([]byte, 6)
-	_, _ = rand.Read(b)
+	rand.Read(b)
 	return hex.EncodeToString(b)
 }

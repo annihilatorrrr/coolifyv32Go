@@ -211,7 +211,7 @@ func runPreDocker(ctx context.Context, f flags) (*mapper.Plan, error) {
 		}
 	}
 	if stack.FluentBitID != "" {
-		_ = stopContainer(ctx, dc, stack.FluentBitID)
+		stopContainer(ctx, dc, stack.FluentBitID)
 		clilog.OK("stopped coolify-fluentbit")
 	}
 
@@ -311,11 +311,23 @@ func runTakeoverAndTeardown(ctx context.Context, f flags, plan *mapper.Plan) err
 	}
 	defer dc.Close()
 
+	// Reopen coolifygo's Postgres so takeover can persist the real container ids
+	// back onto the rows the insert phase created. The DSN + key are already
+	// required for every phase (see run), so post-docker resumes need no extra
+	// flags. Best-effort: a writeback failure is logged, not fatal — the
+	// containers are already live and the reconciler heals stale ids on restart.
+	target, err := cgo.Open(ctx, f.coolifygoDSN, f.coolifygoKey)
+	if err != nil {
+		return err
+	}
+	defer target.Close()
+
 	clilog.Phase(6, 7, "take over running containers")
 	if err = takeover.EnsureNetwork(ctx, dc); err != nil {
 		return fmt.Errorf("ensure coolifygo network: %w", err)
 	}
-	if err = runTakeover(ctx, dc, plan); err != nil {
+	reclaimVols, err := runTakeover(ctx, dc, target, plan)
+	if err != nil {
 		return fmt.Errorf("takeover phase: %w", err)
 	}
 
@@ -325,19 +337,23 @@ func runTakeoverAndTeardown(ctx context.Context, f flags, plan *mapper.Plan) err
 	}
 
 	clilog.Phase(7, 7, "wipe v3 install")
-	if !clilog.Confirm("Wipe v3 containers, volumes, images, network, host paths?", f.yes) {
+	if !clilog.Confirm("Wipe v3 containers, volumes (incl. copied-from database volumes), images, network, host paths?", f.yes) {
 		clilog.Warn("teardown skipped by user")
 		return nil
 	}
-	if err = teardown.Wipe(ctx, dc, os.Stdout); err != nil {
+	if err = teardown.Wipe(ctx, dc, os.Stdout, reclaimVols); err != nil {
 		clilog.Warn("%s", err)
 	}
 
 	// State file was a hand-off artifact between phases. Once we've taken
 	// over + torn down, nothing should ever read it again, and leaving it
-	// around invites a confused re-run.
+	// around invites a confused re-run. Drop the now-empty state dir too so a
+	// completed migration leaves nothing on disk. os.Remove only deletes an
+	// empty dir, so a shared or custom --state-file location that still holds
+	// other files is left untouched.
 	if f.phase == phasePostDocker && f.stateFile != "" {
-		_ = os.Remove(f.stateFile)
+		os.Remove(f.stateFile)
+		os.Remove(filepath.Dir(f.stateFile))
 	}
 	return nil
 }
@@ -420,7 +436,10 @@ func insertAll(ctx context.Context, target *cgo.Client, plan *mapper.Plan) error
 	return tx.Commit(ctx)
 }
 
-func runTakeover(ctx context.Context, dc *client.Client, plan *mapper.Plan) error {
+// runTakeover recreates every workload container and returns the set of v3
+// database source volumes takeover copied from, so teardown can reclaim them.
+func runTakeover(ctx context.Context, dc *client.Client, target *cgo.Client, plan *mapper.Plan) ([]string, error) {
+	var reclaimVols []string
 	for i := range plan.Apps {
 		ap := plan.Apps[i]
 		if ap.NewID == uuid.Nil || ap.Workload == nil {
@@ -433,23 +452,31 @@ func runTakeover(ctx context.Context, dc *client.Client, plan *mapper.Plan) erro
 		}
 		clilog.Info("%s %s → coolifygo-…-%s",
 			verb, ap.Workload.ContainerName, short(ap.NewID.String()))
-		newID, err := takeover.TakeoverApp(ctx, dc, takeover.AppPlanInput{
+		newCID, err := takeover.TakeoverApp(ctx, dc, takeover.AppPlanInput{
 			NewID:    ap.NewID.String(),
 			Name:     ap.Row.Name,
 			Workload: ap.Workload,
 			EnvVars:  ap.Row.EnvVars,
 			Image:    ap.Row.ImageName,
 			Port:     ap.Row.Port,
+			IsBot:    ap.Row.IsBot,
 			Start:    start,
 		})
 		if err != nil {
-			return fmt.Errorf("app %s: %w", ap.Row.Name, err)
+			return nil, fmt.Errorf("app %s: %w", ap.Row.Name, err)
+		}
+		status := "running"
+		if !start {
+			status = "stopped"
+		}
+		if uerr := target.UpdateAppContainer(ctx, ap.NewID, newCID, status); uerr != nil {
+			clilog.Warn("%s: persist container id: %s", ap.Row.Name, uerr)
 		}
 		if !start {
 			clilog.OK("%s created (status=stopped)", ap.Row.Name)
 			continue
 		}
-		if err = takeover.WaitHealthy(ctx, dc, newID, 60*time.Second); err != nil {
+		if err = takeover.WaitHealthy(ctx, dc, newCID, 60*time.Second); err != nil {
 			clilog.Warn("%s: %s", ap.Row.Name, err)
 		} else {
 			clilog.OK("%s running", ap.Row.Name)
@@ -468,7 +495,7 @@ func runTakeover(ctx context.Context, dc *client.Client, plan *mapper.Plan) erro
 		}
 		clilog.Info("%s %s → coolifygo-db-%s (volume copy)",
 			verb, dp.Workload.ContainerName, short(dp.NewID.String()))
-		newID, err := takeover.TakeoverDB(ctx, dc, takeover.DBPlanInput{
+		newCID, err := takeover.TakeoverDB(ctx, dc, takeover.DBPlanInput{
 			NewID:        dp.NewID.String(),
 			Type:         dp.Row.Type,
 			Version:      dp.Row.Version,
@@ -477,6 +504,8 @@ func runTakeover(ctx context.Context, dc *client.Client, plan *mapper.Plan) erro
 			RootUser:     dp.Row.RootUser,
 			RootPassword: dp.Row.RootPassword,
 			DefaultDB:    dp.Row.DefaultDatabase,
+			Slug:         dp.Row.Slug,
+			Name:         dp.Row.Name,
 			PublicPort:   dp.Row.PublicPort,
 			InternalPort: dp.Row.InternalPort,
 			IsPublic:     dp.Row.IsPublic,
@@ -485,19 +514,32 @@ func runTakeover(ctx context.Context, dc *client.Client, plan *mapper.Plan) erro
 			Start:        start,
 		})
 		if err != nil {
-			return fmt.Errorf("db %s: %w", dp.Row.Name, err)
+			return nil, fmt.Errorf("db %s: %w", dp.Row.Name, err)
+		}
+		// Takeover copied this DB's v3 data volume into a fresh coolifygo volume;
+		// record the source so teardown can reclaim it. Recorded for stopped DBs
+		// too — the copy happened regardless of whether we started the container.
+		if srcVol := takeover.FindDataVolume(dp.Workload, dp.Row.Type); srcVol != "" {
+			reclaimVols = append(reclaimVols, srcVol)
+		}
+		status := "running"
+		if !start {
+			status = "stopped"
+		}
+		if uerr := target.UpdateDBContainer(ctx, dp.NewID, newCID, status); uerr != nil {
+			clilog.Warn("%s: persist container id: %s", dp.Row.Name, uerr)
 		}
 		if !start {
 			clilog.OK("%s created (status=stopped)", dp.Row.Name)
 			continue
 		}
-		if err = takeover.WaitHealthy(ctx, dc, newID, 2*time.Minute); err != nil {
+		if err = takeover.WaitHealthy(ctx, dc, newCID, 2*time.Minute); err != nil {
 			clilog.Warn("%s: %s", dp.Row.Name, err)
 		} else {
 			clilog.OK("%s healthy", dp.Row.Name)
 		}
 	}
-	return nil
+	return reclaimVols, nil
 }
 
 func printPlan(plan *mapper.Plan) {

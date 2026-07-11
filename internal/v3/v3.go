@@ -93,7 +93,7 @@ func Open(dbPath, secretKey string) (*Client, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	if err = db.Ping(); err != nil {
-		_ = db.Close()
+		db.Close()
 		return nil, fmt.Errorf("sqlite ping: %w", err)
 	}
 	return &Client{db: db, secretKey: []byte(secretKey)}, nil
@@ -300,4 +300,3 @@ func (c *Client) GitSources() ([]GitSource, error) {
 	}
 	return out, rows.Err()
 }
-

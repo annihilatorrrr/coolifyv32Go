@@ -261,6 +261,34 @@ func (c *Client) InsertDatabase(ctx context.Context, tx pgx.Tx, d DBRow) (uuid.U
 	return id, nil
 }
 
+// UpdateAppContainer records the real container id + status of an application
+// after takeover. The insert phase seeds container_id with v3's (now-removed)
+// container; coolifygo's Stop/Logs/Stats handlers read applications.container_id
+// directly, so we must overwrite it with the freshly-created coolifygo container
+// or those actions target a dead id until the reconciler heals it on restart.
+func (c *Client) UpdateAppContainer(ctx context.Context, id uuid.UUID, containerID, status string) error {
+	_, err := c.Pool.Exec(ctx,
+		`UPDATE applications SET status = $2, container_id = $3, updated_at = NOW() WHERE id = $1`,
+		id, status, containerID)
+	if err != nil {
+		return fmt.Errorf("update application container %s: %w", id, err)
+	}
+	return nil
+}
+
+// UpdateDBContainer records the real container id + status of a database after
+// takeover, for the same reason as UpdateAppContainer: coolifygo's database
+// Stop/Logs/Stats handlers key off databases.container_id.
+func (c *Client) UpdateDBContainer(ctx context.Context, id uuid.UUID, containerID, status string) error {
+	_, err := c.Pool.Exec(ctx,
+		`UPDATE databases SET status = $2, container_id = $3, updated_at = NOW() WHERE id = $1`,
+		id, status, containerID)
+	if err != nil {
+		return fmt.Errorf("update database container %s: %w", id, err)
+	}
+	return nil
+}
+
 // GitSourceRow is the minimal column set for an inserted GitHub App.
 type GitSourceRow struct {
 	Name          string
@@ -300,4 +328,3 @@ func (c *Client) InsertGitSource(ctx context.Context, tx pgx.Tx, g GitSourceRow)
 	}
 	return id, nil
 }
-

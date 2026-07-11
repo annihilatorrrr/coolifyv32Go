@@ -53,6 +53,7 @@ type AppPlanInput struct {
 	Name     string
 	Image    string // image to run (defaults to Workload.Image when blank)
 	Port     int
+	IsBot    bool // no service port; mirrors coolifygo's is_bot label + port-bind skip
 	Start    bool // create-and-start when true; create-only when false (v3 had it stopped)
 }
 
@@ -80,11 +81,16 @@ func TakeoverApp(ctx context.Context, dc *client.Client, in AppPlanInput) (strin
 		ManagedLabel:       "true",
 		"coolifygo.app.id": in.NewID,
 	}
+	// Mirror deploy.BuildAppContainerConfig: bots carry the is_bot label and get
+	// no host port binding (Port>0 && !IsBot is coolifygo's exact bind guard).
+	if in.IsBot {
+		labels["coolifygo.is_bot"] = "true"
+	}
 	hostCfg := &container.HostConfig{
 		RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
 	}
 	exposed := nat.PortSet{}
-	if in.Port > 0 {
+	if in.Port > 0 && !in.IsBot {
 		p := nat.Port(fmt.Sprintf("%d/tcp", in.Port))
 		exposed[p] = struct{}{}
 		hostCfg.PortBindings = nat.PortMap{p: []nat.PortBinding{{HostPort: fmt.Sprintf("%d", in.Port)}}}
@@ -128,6 +134,8 @@ type DBPlanInput struct {
 	RootUser     string
 	RootPassword string
 	DefaultDB    string
+	Slug         string // coolifygo slug; POSTGRES_DB fallback after DefaultDB
+	Name         string // display name; final POSTGRES_DB fallback
 	PublicPort   int
 	InternalPort int
 	IsPublic     bool
@@ -148,7 +156,7 @@ func TakeoverDB(ctx context.Context, dc *client.Client, in DBPlanInput) (string,
 	newName := "coolifygo-db-" + in.NewID[:8]
 	newVol := newName
 
-	srcVol := findDataVolume(in.Workload, in.Type)
+	srcVol := FindDataVolume(in.Workload, in.Type)
 	if srcVol == "" {
 		return "", fmt.Errorf("could not locate v3 data volume on container %s", in.Workload.ContainerName)
 	}
@@ -258,7 +266,7 @@ func WaitHealthy(ctx context.Context, dc *client.Client, containerID string, tim
 // stopAndRemove tolerates "not found" so a post-docker re-run after a partial
 // takeover doesn't blow up on containers we already removed last time.
 func stopAndRemove(ctx context.Context, dc *client.Client, id string) error {
-	_ = dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
+	dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
 	if err := dc.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
 		return err
 	}
@@ -322,14 +330,16 @@ func pullImage(ctx context.Context, dc *client.Client, ref string) error {
 		return err
 	}
 	defer rc.Close()
-	_, _ = io.Copy(io.Discard, rc) // drain so the pull completes
+	io.Copy(io.Discard, rc) // drain so the pull completes
 	return nil
 }
 
-// findDataVolume picks the right Docker volume mount on a v3 DB container —
+// FindDataVolume picks the right Docker volume mount on a v3 DB container —
 // PG keeps data at /var/lib/postgresql/data, redis at /data. Tolerates
-// bind-mounts by skipping anything without a Source volume.
-func findDataVolume(w *discover.V3Workload, dbType string) string {
+// bind-mounts by skipping anything without a Source volume. Exported so the CLI
+// can identify each DB's source volume for reclamation in teardown (takeover
+// copies these into fresh coolifygo-db-<id8> volumes rather than moving them).
+func FindDataVolume(w *discover.V3Workload, dbType string) string {
 	target := dataPath(dbType)
 	for _, m := range w.Volumes {
 		if m.Type != mount.TypeVolume {
@@ -370,10 +380,11 @@ func dbImage(dbType, version string) string {
 }
 
 func dbEnv(in DBPlanInput) (env []string, cmd []string) {
-	defaultDB := in.DefaultDB
-	if defaultDB == "" {
-		defaultDB = in.DBUser
-	}
+	// Mirror coolifygo dbEnv's default-database fallback exactly:
+	// DefaultDatabase → Slug → Name. Only matters on a fresh-init (empty) volume;
+	// a copied v3 volume already carries its databases, but we keep parity so a
+	// coolifygo-driven recreate produces an identical container.
+	defaultDB := firstNonEmpty(in.DefaultDB, in.Slug, in.Name)
 	switch in.Type {
 	case "postgresql":
 		user := in.RootUser
@@ -386,7 +397,11 @@ func dbEnv(in DBPlanInput) (env []string, cmd []string) {
 			"POSTGRES_USER=" + user,
 			"POSTGRES_PASSWORD=" + pw,
 			"POSTGRES_DB=" + defaultDB,
-			"PGUSER=" + user,
+		}
+		// PGUSER only when a user exists (coolifygo guards this) so we don't
+		// pin libpq's default user to an empty string on a userless DB.
+		if user != "" {
+			env = append(env, "PGUSER="+user)
 		}
 	case "redis":
 		// Mirror handler.dbCmd: emit CMD only when there's something the image
@@ -439,9 +454,18 @@ func slug(name string) string {
 	return s
 }
 
+func firstNonEmpty(s ...string) string {
+	for _, v := range s {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // shortRand returns 8 random hex chars for ephemeral container names.
 func shortRand() string {
 	var b [4]byte
-	_, _ = io.ReadFull(rand.Reader, b[:])
+	io.ReadFull(rand.Reader, b[:])
 	return hex.EncodeToString(b[:])
 }
