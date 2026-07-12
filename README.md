@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/annihilatorrrr/coolifyv32Go/main/in
 
 That wrapper does the whole thing end to end:
 
-1. Installs Go if missing
+1. Installs Go if missing or older than required (Go 1.26.5+) — never downgrades a newer host toolchain
 2. `go install`s this migrater from source
 3. **Freezes v3** — stops `coolify` + `coolify-fluentbit`, releasing port 3000 and quiescing SQLite
 4. **Upgrades the host's Docker engine** (always-on — v3 ships with an old version; safe here because v3 is frozen and coolifygo isn't up yet)
@@ -141,7 +141,7 @@ The wrapper is driven entirely by environment variables, so you can pin
 versions or point it at forks without editing the script:
 
 ```bash
-MIGRATER_REF=v1.2.3 GO_VERSION=1.26.3 sudo -E bash install.sh
+MIGRATER_REF=v1.2.3 sudo -E bash install.sh
 ```
 
 | Variable | Default | Purpose |
@@ -186,9 +186,12 @@ destinations, Storages) is intentionally skipped.
    server row already exists (created by coolifygo's `EnsureLocalServer`).
 3. **freeze** — stop `coolify` and `coolify-fluentbit` so v3's SQLite is in a
    consistent state.
-4. **extract + read** — briefly start `coolify`, `docker cp` `/app/db/prod.db`
-   to a temp dir, stop again, open it via `modernc.org/sqlite`, decrypt every
-   secret column with AES-256-CTR keyed by `COOLIFY_SECRET_KEY`.
+4. **extract + read** — `docker cp` `/app/db/prod.db` out of the already-frozen
+   `coolify` container (no restart needed — `docker cp` works on stopped
+   containers and the file is consistent because v3 is quiesced). Opens the
+   copy via `modernc.org/sqlite`, decrypts every secret column with
+   AES-256-CTR keyed by `COOLIFY_SECRET_KEY`. Temp file is cleaned up after
+   the read.
 5. **plan** — map v3 entities onto coolifygo row shapes. Validates that
    buildPacks and DB types are in scope.
 6. **insert** — one Postgres transaction writes git_sources → applications →
