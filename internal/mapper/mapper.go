@@ -118,9 +118,9 @@ func BuildPlan(
 		})
 	}
 
-	// Index workloads by container-name match against v3 app name. v3's
-	// container naming is roughly "<slug>-<id>" or just "<name>-<idsuffix>";
-	// we match on the v3 row id (first 8 chars are commonly in the name).
+	// Index live workloads back to their v3 row id. v3 names every managed
+	// container by the raw row cuid and additionally stamps apps with a
+	// coolify.applicationId label — see indexWorkloads for the exact matching.
 	workloadByV3ID := indexWorkloads(workloads, apps, dbs)
 
 	// Apps
@@ -278,37 +278,67 @@ func (p *Plan) SetGitSourceID(v3SourceID string, newID uuid.UUID) {
 
 func indexWorkloads(workloads []discover.V3Workload, apps []v3.Application, dbs []v3.Database) map[string]discover.V3Workload {
 	out := make(map[string]discover.V3Workload, len(workloads))
-	// v3 container names look like "<name-or-slug>-<id8>" where id8 is the
-	// first 8 chars of the cuid. We match by that suffix.
+
+	// A v3 workload exposes its row cuid in several places; index every signal
+	// so matching is robust to naming quirks:
+	//   - apps carry the cuid in the coolify.applicationId label (set by both
+	//     makeLabelForSimpleDockerfile and makeLabelForStandaloneApplication);
+	//   - both apps and databases name the container by the raw cuid
+	//     (container_name == applicationId / database id — no slug, no dashes);
+	//   - legacy "<slug>-<id8>" style names only surface the id as the trailing
+	//     dash segment, so we also index by an 8-char prefix as a fallback.
+	// Full-id matches win over 8-char-prefix matches (two cuids created close
+	// in time can share a prefix), so the two maps stay separate and full is
+	// consulted first.
+	byFull := make(map[string]discover.V3Workload, len(workloads))
 	byShort := make(map[string]discover.V3Workload, len(workloads))
-	for _, w := range workloads {
-		if w.ContainerName == "" {
-			continue
+	add := func(token string, w discover.V3Workload) {
+		if token == "" {
+			return
 		}
-		parts := strings.Split(w.ContainerName, "-")
-		short := parts[len(parts)-1]
-		byShort[short] = w
+		if _, ok := byFull[token]; !ok {
+			byFull[token] = w
+		}
+		if len(token) >= 8 {
+			if _, ok := byShort[token[:8]]; !ok {
+				byShort[token[:8]] = w
+			}
+		}
+	}
+	for _, w := range workloads {
+		add(w.Labels["coolify.applicationId"], w)
+		add(w.ContainerName, w)
+		if w.ContainerName != "" {
+			parts := strings.Split(w.ContainerName, "-")
+			add(parts[len(parts)-1], w)
+		}
+	}
+
+	match := func(id string) (discover.V3Workload, bool) {
+		if id == "" {
+			return discover.V3Workload{}, false
+		}
+		if w, ok := byFull[id]; ok {
+			return w, true
+		}
+		if len(id) >= 8 {
+			if w, ok := byShort[id[:8]]; ok {
+				return w, true
+			}
+		}
+		return discover.V3Workload{}, false
 	}
 	for _, a := range apps {
-		short := safeShort(a.ID)
-		if w, ok := byShort[short]; ok {
+		if w, ok := match(a.ID); ok {
 			out[a.ID] = w
 		}
 	}
 	for _, d := range dbs {
-		short := safeShort(d.ID)
-		if w, ok := byShort[short]; ok {
+		if w, ok := match(d.ID); ok {
 			out[d.ID] = w
 		}
 	}
 	return out
-}
-
-func safeShort(id string) string {
-	if len(id) < 8 {
-		return id
-	}
-	return id[:8]
 }
 
 // firstHostPort returns the lowest host port from a workload's port bindings,
