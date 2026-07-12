@@ -211,8 +211,24 @@ ensure_migrater() {
 }
 
 # ── Step 6: env from coolifygo ────────────────────────────────────────────
+# coolifygo writes ${COOLIFYGO_ENV} only AFTER its first-run bootstrap finishes:
+# it generates secrets, starts managed Postgres + Redis, then waits (up to
+# ~120s) for Postgres to accept connections before writing the file. So the
+# container being "running" is not enough — we must wait for the file itself to
+# appear and carry both required keys.
 load_coolifygo_env() {
-  [[ -r "${COOLIFYGO_ENV}" ]] || fail "${COOLIFYGO_ENV} not readable — is coolifygo provisioned?"
+  info "waiting for coolifygo to finish first-run bootstrap (writes ${COOLIFYGO_ENV})…"
+  local i=0
+  until [[ -r "${COOLIFYGO_ENV}" ]] && grep -q '^DATABASE_URL=' "${COOLIFYGO_ENV}" 2>/dev/null; do
+    if ((i++ >= 180)); then
+      # Surface the container's own logs — bootstrap failures (e.g. Postgres
+      # never coming up) are reported there.
+      warn "coolifygo did not write ${COOLIFYGO_ENV} within 180s — recent logs:"
+      docker logs --tail=30 coolifygo 2>/dev/null || true
+      fail "${COOLIFYGO_ENV} never became readable — coolifygo bootstrap may have failed"
+    fi
+    sleep 1
+  done
   set -a
   # shellcheck source=/dev/null
   . "${COOLIFYGO_ENV}"
