@@ -182,13 +182,18 @@ ensure_migrater() {
     return
   fi
   info "go install ${MIGRATER_MODULE}@${MIGRATER_REF}"
-  GOBIN=/usr/local/bin GOPROXY=direct go install "${MIGRATER_MODULE}@${MIGRATER_REF}"
-  # go install names the binary after the last path element of the module
-  # (coolifyv32Go), not the command name used throughout this script.
-  if [[ -f /usr/local/bin/coolifyv32Go ]]; then
-    mv /usr/local/bin/coolifyv32Go /usr/local/bin/coolfymigrater
-  fi
-  have coolfymigrater || fail "go install completed but coolfymigrater not on PATH"
+  # Install into a dedicated temp dir so we own exactly one binary regardless
+  # of what go install names it (the last path element of the module, not
+  # necessarily "coolfymigrater").
+  local tmpbin
+  tmpbin=$(mktemp -d)
+  GOENV=off GOBIN="${tmpbin}" GOPROXY=direct go install "${MIGRATER_MODULE}@${MIGRATER_REF}"
+  local produced
+  produced=$(find "${tmpbin}" -maxdepth 1 -type f | head -1)
+  [[ -n "${produced}" ]] || fail "go install produced no binary in ${tmpbin} (contents: $(ls -1 "${tmpbin}" 2>&1))"
+  mv "${produced}" /usr/local/bin/coolfymigrater
+  rm -rf "${tmpbin}"
+  have coolfymigrater || fail "coolfymigrater not on PATH after install"
   ok "coolfymigrater installed: $(command -v coolfymigrater)"
 }
 
