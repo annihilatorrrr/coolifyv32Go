@@ -165,12 +165,13 @@ ensure_coolifygo() {
     return
   fi
   info "installing coolifygo via ${COOLIFYGO_INSTALL_URL}"
-  curl -fsSL "${COOLIFYGO_INSTALL_URL}" | bash
-  # Wait for the coolifygo container itself — that's what the install.sh names
-  # it. Waiting for coolifygo-postgres was fragile (name can differ by version).
+  # The gocoolify installer may exit non-zero when coolifygo is "still
+  # starting" on first boot — we do our own readiness wait below.
+  curl -fsSL "${COOLIFYGO_INSTALL_URL}" | bash || true
+  # Wait for the coolifygo container to appear and be in a running state.
   local i=0
   while ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx coolifygo; do
-    ((i++ >= 90)) && fail "coolifygo container never appeared after 90s"
+    ((i++ >= 120)) && fail "coolifygo container never appeared after 120s"
     sleep 1
   done
   ok "coolifygo installed"
