@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"strings"
 
-	"coolfymigrater/internal/cgo"
-	"coolfymigrater/internal/discover"
-	"coolfymigrater/internal/v3"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/cgo"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/discover"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/v3"
 
 	"github.com/google/uuid"
 )

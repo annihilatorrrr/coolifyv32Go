@@ -1,4 +1,4 @@
-module coolfymigrater
+module github.com/annihilatorrrr/coolifyv32Go
 
 go 1.26.5
 

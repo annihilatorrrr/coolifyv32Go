@@ -48,13 +48,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"coolfymigrater/internal/cgo"
-	"coolfymigrater/internal/clilog"
-	"coolfymigrater/internal/discover"
-	"coolfymigrater/internal/mapper"
-	"coolfymigrater/internal/takeover"
-	"coolfymigrater/internal/teardown"
-	v3pkg "coolfymigrater/internal/v3"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/cgo"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/clilog"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/discover"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/mapper"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/takeover"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/teardown"
+	v3pkg "github.com/annihilatorrrr/coolifyv32Go/internal/v3"
 )
 
 const (

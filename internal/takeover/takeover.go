@@ -23,7 +23,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 
-	"coolfymigrater/internal/discover"
+	"github.com/annihilatorrrr/coolifyv32Go/internal/discover"
 )
 
 const (
