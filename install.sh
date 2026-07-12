@@ -168,10 +168,21 @@ ensure_coolifygo() {
   # The gocoolify installer may exit non-zero when coolifygo is "still
   # starting" on first boot — we do our own readiness wait below.
   curl -fsSL "${COOLIFYGO_INSTALL_URL}" | bash || true
-  # Wait for the coolifygo container to appear and be in a running state.
+
+  # Wait for coolifygo to be running. Use docker ps -a so we can detect a
+  # crashed container (exec format error, bad image, etc.) and report it
+  # clearly instead of looping until timeout.
   local i=0
   while ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx coolifygo; do
-    ((i++ >= 120)) && fail "coolifygo container never appeared after 120s"
+    if ((i++ >= 60)); then
+      # Check if container exists but exited — that's a crash, not a slow start.
+      if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx coolifygo; then
+        warn "coolifygo container exists but is not running — likely a startup crash:"
+        docker logs --tail=20 coolifygo 2>/dev/null || true
+        fail "coolifygo container crashed on startup (see logs above)"
+      fi
+      fail "coolifygo container never appeared after 60s"
+    fi
     sleep 1
   done
   ok "coolifygo installed"
