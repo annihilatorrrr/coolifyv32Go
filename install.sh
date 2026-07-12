@@ -166,10 +166,11 @@ ensure_coolifygo() {
   fi
   info "installing coolifygo via ${COOLIFYGO_INSTALL_URL}"
   curl -fsSL "${COOLIFYGO_INSTALL_URL}" | bash
-  # Wait briefly for coolifygo's Postgres + Redis to come up.
+  # Wait for the coolifygo container itself — that's what the install.sh names
+  # it. Waiting for coolifygo-postgres was fragile (name can differ by version).
   local i=0
-  while ! docker ps --format '{{.Names}}' | grep -qx coolifygo-postgres; do
-    ((i++ >= 60)) && fail "coolifygo-postgres never appeared after 60s"
+  while ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx coolifygo; do
+    ((i++ >= 90)) && fail "coolifygo container never appeared after 90s"
     sleep 1
   done
   ok "coolifygo installed"
@@ -231,9 +232,9 @@ upgrade_docker() {
   case "${pm}" in
     apt)
       DEBIAN_FRONTEND=noninteractive apt-get update -qq
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade --allow-change-held-packages \
         docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages \
         docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
       ;;
     dnf|yum)
