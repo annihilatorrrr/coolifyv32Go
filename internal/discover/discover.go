@@ -94,10 +94,15 @@ func Inspect(ctx context.Context, dc *client.Client) (*V3Stack, error) {
 		return nil, errors.New("COOLIFY_SECRET_KEY not found in coolify container env — supply --v3-secret-key")
 	}
 
-	// All workload containers — every container connected to coolify-infra
-	// that isn't part of v3's own stack is a user workload.
+	// All workload containers — v3 stamps every managed app + database container
+	// with `coolify.managed=true` (see coolify v3 buildPacks/common.ts +
+	// common.ts). Filtering by that label (rather than the coolify-infra network)
+	// is what makes discovery reliable: v3 only attaches an app to coolify-infra
+	// when it's Traefik-routed (has an FQDN). Host-port-only apps live solely on
+	// their destination network and would be invisible to a network filter. The
+	// label catches them all. Include All so stopped workloads are found too.
 	wargs := filters.NewArgs()
-	wargs.Add("network", "coolify-infra")
+	wargs.Add("label", "coolify.managed=true")
 	wlist, err := dc.ContainerList(ctx, container.ListOptions{All: true, Filters: wargs})
 	if err != nil {
 		return nil, fmt.Errorf("list workloads: %w", err)

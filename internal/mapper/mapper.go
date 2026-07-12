@@ -69,11 +69,15 @@ func BuildPlan(
 
 	plan := &Plan{LocalServer: localServer}
 
-	// Validate apps: must be Dockerfile only.
+	// Validate apps: must be a Dockerfile build. v3 names that build pack
+	// "docker" (see coolify v3 buildPacks/docker.ts — "dockerfile" is a
+	// coolifygo-side value, never a v3 one). Everything else — nixpacks,
+	// static, node, php, and crucially "compose" (docker-compose) — is out of
+	// scope and bails here.
 	for _, a := range apps {
 		bp := strings.ToLower(a.BuildPack)
-		if bp != "" && bp != "dockerfile" {
-			return nil, fmt.Errorf("application %q has buildPack=%q — migrater handles dockerfile only", a.Name, a.BuildPack)
+		if bp != "" && bp != "docker" && bp != "dockerfile" {
+			return nil, fmt.Errorf("application %q has buildPack=%q — migrater handles Dockerfile builds only (v3 buildPack \"docker\")", a.Name, a.BuildPack)
 		}
 	}
 
