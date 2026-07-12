@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────
-GO_VERSION="${GO_VERSION:-1.26.3}"
+GO_VERSION="${GO_VERSION:-1.26.5}"
 GO_INSTALL_DIR="${GO_INSTALL_DIR:-/usr/local/go}"
 COOLIFYGO_INSTALL_URL="${COOLIFYGO_INSTALL_URL:-https://raw.githubusercontent.com/annihilatorrrr/gocoolify/main/install.sh}"
 MIGRATER_MODULE="${MIGRATER_MODULE:-github.com/annihilatorrrr/coolifyv32Go}"
