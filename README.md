@@ -26,25 +26,143 @@ That wrapper does the whole thing end to end:
 
 No manual flags required — DSN + encryption key are sourced from `/data/coolifygo/.env`.
 
-## Manual run (without install.sh)
+## Install
+
+The migrater is a single Go binary. You can install it the same way
+`install.sh` does, or build it from source.
+
+```bash
+# Install the published binary onto PATH (what install.sh runs internally)
+GOBIN=/usr/local/bin go install github.com/annihilatorrrr/coolifyv32Go@latest
+
+# …or build from a checkout of this repo
+git clone https://github.com/annihilatorrrr/coolifyv32Go
+cd coolifyv32Go
+go build -o bin/coolfymigrater .      # binary at ./bin/coolfymigrater
+```
+
+Requires Go 1.26.5+ and a local Docker socket. No CGO — the SQLite reader is
+pure Go (`modernc.org/sqlite`).
+
+## Usage
 
 ```
+coolfymigrater [flags]
+```
+
+The two connection flags are the only required inputs. Everything about the
+v3 side (`COOLIFY_SECRET_KEY`, the `prod.db` path, the workload containers) is
+auto-detected from the running `coolify` container — you never supply those.
+
+#### Where do the DSN and key come from?
+
+You don't invent them — **coolifygo writes them to its own env file when it is
+installed**, at `/data/coolifygo/.env`:
+
+```
+DATABASE_URL=postgres://coolifygo:...@coolifygo-postgres:5432/coolifygo
+DATA_ENCRYPTION_KEY=<base64 of 32 random bytes>
+```
+
+- **Via `install.sh` (the one-command path): you do nothing.** The wrapper
+  sources `/data/coolifygo/.env` for you (`load_coolifygo_env`) and passes both
+  values through — no flags, no exports.
+- **Running the binary by hand:** source that same file first so the two flags
+  pick the values up from the environment:
+
+  ```bash
+  set -a; . /data/coolifygo/.env; set +a   # exports DATABASE_URL + DATA_ENCRYPTION_KEY
+  coolfymigrater --yes
+  ```
+
+  or point at it explicitly without exporting anything:
+
+  ```bash
+  coolfymigrater \
+    --coolifygo-dsn="$(grep '^DATABASE_URL='        /data/coolifygo/.env | cut -d= -f2-)" \
+    --coolifygo-key="$(grep '^DATA_ENCRYPTION_KEY=' /data/coolifygo/.env | cut -d= -f2-)"
+  ```
+
+(The file path is configurable in `install.sh` via `COOLIFYGO_ENV`.)
+
+### Flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--coolifygo-dsn` | `$DATABASE_URL` | **Required.** coolifygo Postgres DSN to write the migrated rows into. |
+| `--coolifygo-key` | `$DATA_ENCRYPTION_KEY` | **Required.** coolifygo `DATA_ENCRYPTION_KEY` — base64 of 32 raw bytes. Secrets are re-encrypted under this key (AES-256-GCM, `enc:v1:` prefix). |
+| `--v3-secret-key` | auto-detected | v3 `COOLIFY_SECRET_KEY` used to decrypt v3's secret columns. Read from the `coolify` container's env when blank; pass it explicitly only if that detection fails. |
+| `--v3-sqlite` | auto-extracted | Path to v3's `prod.db` on the host. When blank, it is `docker cp`'d out of the (frozen) `coolify` container to a temp dir and cleaned up afterwards. |
+| `--phase` | `all` | `all` (single-shot), `pre-docker` (discover → insert, then save state and exit), or `post-docker` (reload state → takeover → teardown). Used by `install.sh` to bracket the Docker-engine upgrade. |
+| `--state-file` | `/var/lib/coolfymigrater/state.json` | Where `pre-docker` writes / `post-docker` reads the plan JSON. |
+| `--dry-run` | `false` | Print the full plan and exit before any change. |
+| `--yes` | `false` | Skip the interactive confirmation prompts (proceed + teardown). |
+| `--no-teardown` | `false` | Keep the v3 stack alive after the data migration + takeover complete. |
+
+### Environment variables
+
+| Variable | Equivalent flag | Where it comes from |
+|---|---|---|
+| `DATABASE_URL` | `--coolifygo-dsn` | Written by coolifygo into `/data/coolifygo/.env` at install. |
+| `DATA_ENCRYPTION_KEY` | `--coolifygo-key` | Written by coolifygo into `/data/coolifygo/.env` at install. |
+| `DOCKER_HOST` / `DOCKER_*` | — | Standard Docker SDK env — points the client at the local daemon socket (defaults to the local socket). |
+
+### Examples
+
+```bash
+# 1. Dry run — see exactly what would be migrated, change nothing.
+coolfymigrater --coolifygo-dsn=$DATABASE_URL --coolifygo-key=$DATA_ENCRYPTION_KEY --dry-run
+
+# 2. Full single-shot migration, no prompts (env vars already exported).
+coolfymigrater --yes
+
+# 3. Migrate the data + take over containers, but LEAVE v3 running
+#    (nothing is wiped — useful to validate coolifygo before committing).
+coolfymigrater --yes --no-teardown
+
+# 4. Provide v3 secrets explicitly if auto-detection can't reach the container.
 coolfymigrater \
-  --coolifygo-dsn=postgres://coolifygo:...@coolifygo-postgres:5432/coolifygo \
-  --coolifygo-key=$(grep DATA_ENCRYPTION_KEY /data/coolifygo/.env | cut -d= -f2)
+  --v3-secret-key=base64:xxxxxxxx... \
+  --v3-sqlite=/data/coolify/source/prod.db
+
+# 5. Phase-split run by hand (what install.sh does around a Docker upgrade).
+coolfymigrater --phase=pre-docker  --state-file=/tmp/mig.json --yes
+#   … upgrade Docker / restart the daemon here …
+coolfymigrater --phase=post-docker --state-file=/tmp/mig.json --yes
 ```
 
-Both flags fall back to `$DATABASE_URL` and `$DATA_ENCRYPTION_KEY` env vars.
-`--v3-secret-key` and `--v3-sqlite` are auto-detected from the running
-`coolify` container; pass them if discovery fails.
+> The connection flags (`--coolifygo-dsn` / `--coolifygo-key`) are required in
+> **every** phase, including `post-docker` — takeover reopens Postgres to write
+> the real container ids back onto the migrated rows.
 
-| Flag | Purpose |
-|---|---|
-| `--phase` | `all` (default), `pre-docker` (stops after insert), or `post-docker` (resumes from state file). Used by `install.sh` to bracket the Docker upgrade. |
-| `--state-file` | Where `pre-docker` writes / `post-docker` reads the plan JSON (default `/var/lib/coolfymigrater/state.json`). |
-| `--dry-run` | Print the plan and exit. |
-| `--yes` | Skip confirmation prompts. |
-| `--no-teardown` | Keep v3 alive after data migration. |
+### `install.sh` overrides
+
+The wrapper is driven entirely by environment variables, so you can pin
+versions or point it at forks without editing the script:
+
+```bash
+MIGRATER_REF=v1.2.3 GO_VERSION=1.26.3 sudo -E bash install.sh
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GO_VERSION` | `1.26.5` | Minimum Go required (matches go.mod) and the version installed when the host is short of it. A host with this version or newer is used untouched — never downgraded. |
+| `GO_INSTALL_DIR` | `/usr/local/go` | Where the Go tarball is unpacked (removed on exit if the script installed it). |
+| `COOLIFYGO_INSTALL_URL` | gocoolify `install.sh` | Installer used to bring up coolifygo when it isn't already running. |
+| `MIGRATER_MODULE` | `github.com/annihilatorrrr/coolifyv32Go` | Module path passed to `go install`. |
+| `MIGRATER_REF` | `latest` | Git ref / version to install (`@<ref>`). |
+| `STATE_FILE` | `/var/lib/coolfymigrater/state.json` | Passed through as `--state-file` to both phases. |
+| `COOLIFYGO_ENV` | `/data/coolifygo/.env` | File sourced for `DATABASE_URL` + `DATA_ENCRYPTION_KEY`. |
+| `ASSUME_YES` | `1` | When `1`, passes `--yes` to the binary so `curl \| bash` runs unattended. Set to `0` to keep the prompts. |
+
+## Build & test
+
+```bash
+go build ./...                    # compile everything
+go build -o bin/coolfymigrater .  # build the CLI binary
+go vet ./...
+go test ./...
+```
 
 ## Scope
 
@@ -53,7 +171,8 @@ Built for the narrow shape the operator described:
 - v3 manages **Dockerfile-built apps only** (other build packs error out).
 - v3 manages **PostgreSQL + Redis databases only** (MySQL / Mongo error out).
 - **No persistent storage** on application containers.
-- A single **GitHub App** git source.
+- **GitHub App** git sources only — other git-source auth types are skipped
+  (multiple GitHub App sources are supported).
 - v3 runs on the **same host** as coolifygo (local Docker socket).
 
 Everything else (services, FQDN/Traefik/SSL, teams, PR previews, remote
@@ -74,18 +193,27 @@ destinations, Storages) is intentionally skipped.
    buildPacks and DB types are in scope.
 6. **insert** — one Postgres transaction writes git_sources → applications →
    databases. Rollback on any failure leaves coolifygo untouched.
-7. **takeover** — apps are recreated as `coolifygo-<slug>-<id8>` with the
-   existing image + env + port binding + coolifygo's labels/network.
-   Databases stop, get their data volume copied to `coolifygo-db-<id8>` via a
-   one-shot alpine container, then start fresh with coolifygo's canonical
-   image, env, healthcheck, and network.
-8. **teardown** — stop+remove every v3 stack container (coolify, fluentbit,
-   coolify-proxy), drop the seven v3 volumes (coolify-db, coolify-logs,
-   coolify-local-backup, coolify-ssl-certs, two letsencrypt volumes, and the
-   optional coolify-pgdb), prune `coollabsio/coolify` + `ghcr.io/coollabsio`
-   images, remove the `coolify-infra` network, and clean host paths
-   (`/data/coolify`, `/var/lib/coolify`, `/etc/cron.d/coolify-default`,
-   `/usr/local/bin/coolify`).
+7. **takeover** — apps are recreated as `coolifygo-<slug>-<id8>` on the
+   `coolifygo` bridge network with the existing image + env + host port
+   binding + coolifygo's `coolifygo.managed` label. Databases stop, get their
+   data volume **copied** (not moved) to `coolifygo-db-<id8>` via a one-shot
+   `alpine:3` container, then start fresh as `coolifygo-db-<id8>` with
+   coolifygo's canonical image (`postgres:<v>-alpine` / `redis:<v>-alpine`),
+   env, healthcheck, and network. After each recreate the real new container
+   id + status are written back onto the coolifygo row.
+8. **teardown** — stop+remove every v3 stack container (`coolify`,
+   `coolify-fluentbit`, `coolify-proxy`, `coolify-haproxy`); drop the seven v3
+   infra volumes (`coolify-db`, `coolify-logs`, `coolify-local-backup`,
+   `coolify-ssl-certs`, two letsencrypt volumes, and the optional
+   `coolify-pgdb`); reclaim each **copied-from database source volume** (the
+   originals takeover copied out of — guarded: never touches a `coolifygo-`
+   volume, `force=false` so an in-use one is reported, not destroyed); prune
+   `coollabsio/coolify`, `ghcr.io/coollabsio/coolify`, and
+   `ghcr.io/coollabsio/fluent-bit` images plus the migrater's own `alpine:3`
+   copy-helper (only if unused); remove the `coolify-infra` network; and clean
+   host paths (`/data/coolify`, `/var/lib/coolify`, `/etc/cron.d/coolify-default`,
+   `/usr/local/bin/coolify`). On a completed `post-docker` run the migrater
+   also removes its own state file and the now-empty state directory.
 
 ## What gets copied
 
@@ -98,12 +226,17 @@ destinations, Storages) is intentionally skipped.
 
 ## What gets thrown away
 
-- v3 management containers + their volumes + their Docker network.
+- v3 management containers (`coolify`, `coolify-fluentbit`, `coolify-proxy`,
+  `coolify-haproxy`) + their infra volumes + the `coolify-infra` network.
+- The original v3 **database source volumes** — reclaimed after their contents
+  were copied into the new `coolifygo-db-<id8>` volumes.
 - v3 host paths (`/data/coolify`, `/var/lib/coolify`, the systemd unit hint
   binary `/usr/local/bin/coolify`, the `/etc/cron.d/coolify-default` cron).
 - v3 Traefik / Let's Encrypt state (SSL is out of scope in coolifygo).
 - v3 backup volumes (coolifygo runs its own backup pipeline; old archives are
   not migrated).
+- `coollabsio/*` + `ghcr.io/coollabsio/*` images, and the migrater's own
+  `alpine:3` copy-helper (only when no other container still uses it).
 
 ## Safety
 

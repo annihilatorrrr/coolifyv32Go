@@ -6,7 +6,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/annihilatorrrr/coolifyv32Go/main/install.sh | sudo bash
 #
 # The wrapper:
-#   1. Installs Go (if missing) at /usr/local/go using the official tarball.
+#   1. Installs Go (only if missing or older than required) at /usr/local/go
+#      using the official tarball — never downgrades a newer host toolchain.
 #   2. `go install`s the coolfymigrater binary from this repo's main branch.
 #   3. Freezes v3 (stops `coolify` + `coolify-fluentbit`) — releases :3000 so
 #      coolifygo can bind it, and quiesces SQLite for extraction.
@@ -65,26 +66,31 @@ detect_pkg_mgr() {
 }
 
 # ── Step 1: Go ────────────────────────────────────────────────────────────
-GO_PREEXISTED=0        # 1 = Go was already on the host before we touched it
-GO_OLD_VERSION=""      # stash the original version string for the log
+# GO_VERSION is the MINIMUM the migrater needs (kept in lockstep with go.mod's
+# `go` directive) and the version we install when the host is short of it. We
+# only ever move Go FORWARD — a host that already has GO_VERSION or newer is
+# used untouched, never downgraded.
+GO_WE_INSTALLED=0      # 1 = THIS script laid Go down at GO_INSTALL_DIR
+GO_OLD_VERSION=""      # pre-existing version string, for the log
+
+# version_ge A B → success (0) iff version A >= version B (numeric-aware).
+version_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]; }
 
 ensure_go() {
-  local arch tarball url
+  local arch tarball url cur
   arch=$(detect_arch)
   tarball="go${GO_VERSION}.linux-${arch}.tar.gz"
   url="https://go.dev/dl/${tarball}"
 
   if have go; then
-    GO_OLD_VERSION="$(go version | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?')"
-    if go version | grep -qE "go${GO_VERSION//./\\.}"; then
-      ok "Go ${GO_VERSION} already installed: $(go version)"
-      GO_PREEXISTED=1
+    cur="$(go version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"
+    GO_OLD_VERSION="${cur}"
+    if [[ -n "${cur}" ]] && version_ge "${cur}" "${GO_VERSION}"; then
+      ok "Go ${cur} already installed (>= ${GO_VERSION} required) — using it as-is"
       return
     fi
-    GO_PREEXISTED=1
-    info "upgrading Go from ${GO_OLD_VERSION} → ${GO_VERSION}"
+    info "host Go ${cur:-unknown} is older than ${GO_VERSION}; upgrading"
   else
-    GO_PREEXISTED=0
     info "installing Go ${GO_VERSION} (fresh)"
   fi
 
@@ -92,30 +98,34 @@ ensure_go() {
   curl -fsSL --retry 3 -o "/tmp/${tarball}" "${url}"
   tar -C "$(dirname "${GO_INSTALL_DIR}")" -xzf "/tmp/${tarball}"
   rm -f "/tmp/${tarball}"
+  GO_WE_INSTALLED=1
 
   if ! grep -q "${GO_INSTALL_DIR}/bin" /etc/profile.d/go.sh 2>/dev/null; then
     cat > /etc/profile.d/go.sh <<EOF
-export PATH=\$PATH:${GO_INSTALL_DIR}/bin:\$HOME/go/bin
+export PATH=${GO_INSTALL_DIR}/bin:\$PATH:\$HOME/go/bin
 EOF
     chmod +x /etc/profile.d/go.sh
   fi
-  export PATH="${PATH}:${GO_INSTALL_DIR}/bin:${HOME}/go/bin"
+  # Prepend so the toolchain we just unpacked wins over any older packaged `go`.
+  export PATH="${GO_INSTALL_DIR}/bin:${PATH}:${HOME}/go/bin"
   ok "Go installed: $(go version)"
 }
 
-# Called at the end of main — removes Go that we installed/upgraded.
+# Called at the end of main — removes ONLY a Go that this script installed.
+# A pre-existing/adequate toolchain is left exactly as we found it.
 cleanup_go() {
-  if [[ "${GO_PREEXISTED}" -eq 0 ]]; then
-    info "removing Go (was not present before migration)"
-    rm -rf "${GO_INSTALL_DIR}"
-    rm -f /etc/profile.d/go.sh
-    ok "Go removed"
-  else
-    info "removing Go ${GO_VERSION} that we upgraded to (was ${GO_OLD_VERSION} before)"
-    rm -rf "${GO_INSTALL_DIR}"
-    rm -f /etc/profile.d/go.sh
-    ok "Go removed — reinstall your previous version if needed"
+  if [[ "${GO_WE_INSTALLED}" -ne 1 ]]; then
+    info "leaving host Go ${GO_OLD_VERSION:-} untouched (not installed by us)"
+    return
   fi
+  if [[ -n "${GO_OLD_VERSION}" ]]; then
+    info "removing Go ${GO_VERSION} we installed (host had ${GO_OLD_VERSION} before — reinstall it if needed)"
+  else
+    info "removing Go ${GO_VERSION} (was not present before migration)"
+  fi
+  rm -rf "${GO_INSTALL_DIR}"
+  rm -f /etc/profile.d/go.sh
+  ok "Go removed"
 }
 
 # ── Step 0: Docker presence ───────────────────────────────────────────────
