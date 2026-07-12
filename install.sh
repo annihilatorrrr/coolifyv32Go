@@ -182,7 +182,7 @@ ensure_migrater() {
     return
   fi
   info "go install ${MIGRATER_MODULE}@${MIGRATER_REF}"
-  GOBIN=/usr/local/bin go install "${MIGRATER_MODULE}@${MIGRATER_REF}"
+  GOBIN=/usr/local/bin GOPROXY=direct go install "${MIGRATER_MODULE}@${MIGRATER_REF}"
   have coolfymigrater || fail "go install completed but coolfymigrater not on PATH"
   ok "coolfymigrater installed: $(command -v coolfymigrater)"
 }

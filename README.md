@@ -150,7 +150,7 @@ MIGRATER_REF=v1.2.3 sudo -E bash install.sh
 | `GO_INSTALL_DIR` | `/usr/local/go` | Where the Go tarball is unpacked (removed on exit if the script installed it). |
 | `COOLIFYGO_INSTALL_URL` | gocoolify `install.sh` | Installer used to bring up coolifygo when it isn't already running. |
 | `MIGRATER_MODULE` | `github.com/annihilatorrrr/coolifyv32Go` | Module path passed to `go install`. |
-| `MIGRATER_REF` | `latest` | Git ref / version to install (`@<ref>`). |
+| `MIGRATER_REF` | `latest` | Git ref / version to install (`@<ref>`). `go install` runs with `GOPROXY=direct` so it always fetches from GitHub, bypassing the module proxy cache. |
 | `STATE_FILE` | `/var/lib/coolfymigrater/state.json` | Passed through as `--state-file` to both phases. |
 | `COOLIFYGO_ENV` | `/data/coolifygo/.env` | File sourced for `DATABASE_URL` + `DATA_ENCRYPTION_KEY`. |
 | `ASSUME_YES` | `1` | When `1`, passes `--yes` to the binary so `curl \| bash` runs unattended. Set to `0` to keep the prompts. |
