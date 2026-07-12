@@ -185,7 +185,7 @@ func runPreDocker(ctx context.Context, f flags) (*mapper.Plan, error) {
 		return nil, err
 	}
 	clilog.OK("found `coolify` container %s", short(stack.CoolifyContainerID))
-	clilog.OK("found %d workload container(s) on coolify-infra", len(stack.WorkloadContainers))
+	clilog.OK("found %d v3-managed workload container(s) (label coolify.managed=true)", len(stack.WorkloadContainers))
 	if f.v3SecretKey != "" {
 		stack.SecretKey = f.v3SecretKey
 	}
