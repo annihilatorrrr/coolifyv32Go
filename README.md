@@ -98,6 +98,7 @@ DATA_ENCRYPTION_KEY=<base64 of 32 random bytes>
 | `--dry-run` | `false` | Print the full plan and exit before any change. |
 | `--yes` | `false` | Skip the interactive confirmation prompts (proceed + teardown). |
 | `--no-teardown` | `false` | Keep the v3 stack alive after the data migration + takeover complete. |
+| `--oldfix` | `false` | **Repair mode.** Adopt workload containers a previous interrupted takeover left running under their old v3 names — no v3 SQLite, state file, or image rebuild needed. See [Repair mode](#repair-mode---oldfix). |
 
 ### Environment variables
 
@@ -129,6 +130,11 @@ coolfymigrater \
 coolfymigrater --phase=pre-docker  --state-file=/tmp/mig.json --yes
 #   … upgrade Docker / restart the daemon here …
 coolfymigrater --phase=post-docker --state-file=/tmp/mig.json --yes
+
+# 6. Repair a half-finished takeover (containers still up under old v3 names).
+#    Needs only the coolifygo connection — v3 can be long gone.
+set -a; . /data/coolifygo/.env; set +a
+coolfymigrater --oldfix
 ```
 
 > The connection flags (`--coolifygo-dsn` / `--coolifygo-key`) are required in
@@ -252,6 +258,17 @@ destinations, Storages) is intentionally skipped.
   takeover leaves a partial state in coolifygo but never destroys v3's data
   volumes (those are dropped by the teardown phase, gated by a confirm prompt
   unless `--yes` is passed).
+- **Completeness guard on teardown.** Every discovered v3-managed container must
+  map to a migrated app/DB. If any go unmatched (an *orphan* — the failure mode
+  that strands a running workload), teardown is **refused** and v3 is left fully
+  intact so nothing is stranded or destroyed. This overrides `--yes` on purpose:
+  v3 is never wiped while the picture is partial. The unmatched containers are
+  listed in the plan output; investigate, fix the mapping, and re-run — or use
+  `--oldfix` afterward to adopt whatever the takeover left behind.
+- **Git-link visibility.** An application that referenced a v3 git source the
+  migrater couldn't turn into a usable coolifygo GitHub App is imported without
+  git integration (auto-deploy/rebuild off) and flagged loudly in the plan —
+  never dropped silently.
 - `--dry-run` prints the full plan and exits before any change.
 
 ## Re-runs
@@ -266,3 +283,39 @@ destinations, Storages) is intentionally skipped.
   from scratch.
 - A fully successful post-docker run deletes the state file so a stale resume
   can't confuse a future invocation.
+
+## Repair mode (`--oldfix`)
+
+If a takeover was interrupted — or an earlier bug left a workload unmatched —
+you can end up with coolifygo holding the application rows while the actual
+containers are still running under their **old v3 names**. coolifygo then shows
+those apps as stopped / container-less even though the process never stopped.
+The normal `post-docker` resume can't help once v3 is gone (no SQLite, no state
+file), so `--oldfix` is a standalone repair that works from **only** coolifygo's
+Postgres and the live Docker daemon:
+
+```bash
+set -a; . /data/coolifygo/.env; set +a   # DATABASE_URL + DATA_ENCRYPTION_KEY
+coolfymigrater --oldfix                  # review the proposed adoptions, then confirm
+```
+
+For each application row whose expected `coolifygo-<slug>-<id8>` container isn't
+running, it finds the leftover live container and **adopts** it. Only genuine
+coolify v3 leftovers are ever considered — a candidate must carry v3's
+`coolify.managed=true` label, so an unrelated host container that merely shares
+a name with an app row is never touched. Adoption then:
+
+- **Renames** it to the coolifygo name the reconciler expects — same container,
+  **zero downtime**, no image rebuild or pull.
+- Attaches it to the `coolifygo` network (best-effort — coolifygo manages by
+  name + id regardless).
+- Writes the live **container id**, **image**, **host port**, and
+  `status=running` back onto the row, so Stop/Logs/Stats target the live
+  container and the reconciler can heal it later.
+
+It is safe and re-runnable: matches are bijective and unambiguous (anything
+uncertain is reported and left untouched), it prompts before changing anything
+(skip with `--yes`), and it is a **no-op** when every row already maps to a
+running container. It requires `--coolifygo-dsn` + `--coolifygo-key` like every
+other mode. Scope is **applications only** — a database whose data volume was
+already reclaimed at teardown can't be re-homed by a rename.

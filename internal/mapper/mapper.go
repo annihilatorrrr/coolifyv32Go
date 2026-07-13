@@ -24,6 +24,7 @@ type Plan struct {
 	Apps            []AppPlan
 	Databases       []DBPlan
 	OrphanWorkloads []OrphanWorkload
+	GitLinkWarnings []string
 	LocalServer     uuid.UUID
 }
 
@@ -107,7 +108,13 @@ func BuildPlan(
 		ghByID[g.ID] = g
 	}
 
-	// Git sources: only github-app rows with a usable GithubApp join.
+	// Git sources: only github-app rows with a usable GithubApp join. coolifygo
+	// needs exactly app_id + pem (JWT signing) + client_id/client_secret/
+	// webhook_secret (webhooks); it hits api.github.com directly and resolves
+	// the installation per-repo at deploy time, so no base_url / installation_id
+	// is stored. importedSrc lets us flag apps below whose git source we could
+	// NOT import, rather than silently dropping their git integration.
+	importedSrc := make(map[string]bool, len(sources))
 	for _, s := range sources {
 		if s.GitHubAppID == "" {
 			continue
@@ -128,6 +135,7 @@ func BuildPlan(
 				PEM:           gh.PrivateKey,
 			},
 		})
+		importedSrc[s.ID] = true
 	}
 
 	// Index live workloads back to their v3 row id. v3 names every managed
@@ -157,6 +165,14 @@ func BuildPlan(
 			WebhookSecret:      webhookSecret,
 		}
 		ap := AppPlan{V3App: a, Row: row, V3SrcID: a.GitSourceID}
+		// Surface a lost git link rather than importing it silently: an app that
+		// referenced a v3 git source we couldn't turn into a coolifygo GitHub App
+		// (missing/incomplete GithubApp row) is migrated without git integration,
+		// so auto-deploy / rebuild-on-webhook won't work until it's re-linked.
+		if a.GitSourceID != "" && !importedSrc[a.GitSourceID] {
+			plan.GitLinkWarnings = append(plan.GitLinkWarnings,
+				fmt.Sprintf("app %q references a git source with no usable GitHub App — imported without git integration (auto-deploy/rebuild off until re-linked)", a.Name))
+		}
 		if w, ok := workloadByV3ID[a.ID]; ok {
 			ap.Workload = new(w)
 			ap.Row.ContainerID = w.ContainerID
@@ -344,48 +360,89 @@ type AdoptTarget struct {
 	AppID     uuid.UUID
 }
 
-// MatchAdoptable pairs orphaned application rows with leftover live containers
-// by name. Pure — no IO. Only bijective, unambiguous matches become targets:
-// an app matching zero or many candidates, or a candidate claimed by many
-// apps, is reported in unmatched and left untouched. Safety over cleverness —
-// the caller confirms interactively before renaming anything.
+// MatchAdoptable pairs orphaned application rows with leftover live containers.
+// Pure — no IO. Two passes:
+//
+//	1. Deterministic: the row's seeded container_id points straight at a live
+//	   container (the insert phase stamps v3's id onto the row when it matched a
+//	   workload). No name guessing — this wins, because v3 names workload
+//	   containers by raw cuid, which rarely equals the human app name.
+//	2. Bijective name match on the leftovers. An app matching zero or many
+//	   candidates, or a candidate claimed by many apps, is reported in unmatched
+//	   and left untouched.
+//
+// Safety over cleverness — the caller confirms interactively before renaming
+// anything, and prints the expected container name for whatever stays unmatched
+// so the operator can rename by hand and re-run.
 func MatchAdoptable(apps []cgo.AppInfo, candidates []AdoptCandidate) (targets []AdoptTarget, unmatched []string) {
-	appMatches := make([][]int, len(apps))        // candidate idxs per app
-	candMatches := make([][]int, len(candidates)) // app idxs per candidate
+	claimed := make([]bool, len(candidates))
+	matched := make([]bool, len(apps))
+
+	// Pass 1 — container_id match.
+	byID := make(map[string]int, len(candidates))
+	for i := range candidates {
+		byID[candidates[i].ID] = i
+	}
 	for ai := range apps {
+		if apps[ai].ContainerID == "" {
+			continue
+		}
+		if ci, ok := byID[apps[ai].ContainerID]; ok && !claimed[ci] {
+			claimed[ci], matched[ai] = true, true
+			targets = append(targets, adoptTarget(apps[ai], candidates[ci]))
+		}
+	}
+
+	// Pass 2 — bijective name match among unmatched apps and unclaimed candidates.
+	appHits := make([][]int, len(apps))
+	candHits := make([][]int, len(candidates))
+	for ai := range apps {
+		if matched[ai] {
+			continue
+		}
 		for ci := range candidates {
+			if claimed[ci] {
+				continue
+			}
 			if nameMatch(apps[ai].Name, candidates[ci].Name) {
-				appMatches[ai] = append(appMatches[ai], ci)
-				candMatches[ci] = append(candMatches[ci], ai)
+				appHits[ai] = append(appHits[ai], ci)
+				candHits[ci] = append(candHits[ci], ai)
 			}
 		}
 	}
 	for ai := range apps {
+		if matched[ai] {
+			continue
+		}
 		a := apps[ai]
-		switch len(appMatches[ai]) {
+		switch len(appHits[ai]) {
 		case 0:
 			unmatched = append(unmatched, fmt.Sprintf("app %q: no live container matched", a.Name))
 			continue
 		case 1:
 		default:
-			unmatched = append(unmatched, fmt.Sprintf("app %q: %d live containers matched (ambiguous)", a.Name, len(appMatches[ai])))
+			unmatched = append(unmatched, fmt.Sprintf("app %q: %d live containers matched (ambiguous)", a.Name, len(appHits[ai])))
 			continue
 		}
-		ci := appMatches[ai][0]
-		if len(candMatches[ci]) != 1 {
+		ci := appHits[ai][0]
+		if len(candHits[ci]) != 1 {
 			unmatched = append(unmatched, fmt.Sprintf("app %q: container %q also matches other apps (ambiguous)", a.Name, candidates[ci].Name))
 			continue
 		}
-		targets = append(targets, AdoptTarget{
-			AppID:     a.ID,
-			AppName:   a.Name,
-			NewName:   AppContainerName(a.ID, a.Name),
-			LiveID:    candidates[ci].ID,
-			LiveImage: candidates[ci].Image,
-			HostPort:  candidates[ci].HostPort,
-		})
+		targets = append(targets, adoptTarget(a, candidates[ci]))
 	}
 	return targets, unmatched
+}
+
+func adoptTarget(a cgo.AppInfo, c AdoptCandidate) AdoptTarget {
+	return AdoptTarget{
+		AppID:     a.ID,
+		AppName:   a.Name,
+		NewName:   AppContainerName(a.ID, a.Name),
+		LiveID:    c.ID,
+		LiveImage: c.Image,
+		HostPort:  c.HostPort,
+	}
 }
 
 // nameMatch reports whether a v3 container name refers to the given app. v3

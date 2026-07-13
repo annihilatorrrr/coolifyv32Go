@@ -107,7 +107,11 @@ func main() {
 		clilog.Fail("%s", err.Error())
 		os.Exit(1)
 	}
-	clilog.OK("migration complete")
+	// --oldfix prints its own per-app summary; "migration complete" would be
+	// misleading (it repairs, it doesn't migrate).
+	if !f.oldfix {
+		clilog.OK("migration complete")
+	}
 }
 
 func parseFlags() flags {
@@ -426,8 +430,9 @@ func runOldFix(ctx context.Context, f flags) error {
 		return fmt.Errorf("list running containers: %w", err)
 	}
 	type live struct {
-		id   string
-		port int
+		id    string
+		image string
+		port  int
 	}
 	byName := make(map[string]live, len(running))
 	var candidates []mapper.AdoptCandidate
@@ -435,14 +440,16 @@ func runOldFix(ctx context.Context, f flags) error {
 		c := running[i]
 		name := stripName(c.Names)
 		port := lowestPublicPort(c.Ports)
-		byName[name] = live{id: c.ID, port: port}
-		// A candidate is a leftover workload container: anything not already
-		// coolifygo-managed. We deliberately do NOT require v3's
-		// `coolify.managed` label — the matching failure that stranded these
-		// containers may itself be a labelling quirk, so we stay lenient and
-		// lean on the bijective name match + interactive confirmation for
-		// safety rather than a filter that might exclude the very containers we
-		// need to fix.
+		byName[name] = live{id: c.ID, image: c.Image, port: port}
+		// A candidate must be a genuine coolify v3 leftover: it carries v3's
+		// `coolify.managed=true` label — the same signal discovery keys on, which
+		// v3 stamps on every managed app/db container. This guarantees --oldfix
+		// never adopts an unrelated host container that merely happens to share a
+		// name with an app row; the bijective name match + interactive
+		// confirmation are second and third gates on top.
+		if c.Labels["coolify.managed"] != "true" {
+			continue
+		}
 		if strings.HasPrefix(name, "coolifygo") || c.Labels["coolifygo.managed"] == "true" {
 			continue
 		}
@@ -467,20 +474,51 @@ func runOldFix(ctx context.Context, f flags) error {
 		if a.ContainerID == lv.id && a.Status == "running" {
 			continue
 		}
-		if uerr := target.AdoptApplication(ctx, a.ID, lv.id, a.ImageName, lv.port); uerr != nil {
+		// Pass the live image so a row that never got one (interrupted takeover)
+		// gains it, letting the reconciler heal the app later.
+		if uerr := target.AdoptApplication(ctx, a.ID, lv.id, lv.image, lv.port); uerr != nil {
 			clilog.Warn("%s: refresh row: %s", a.Name, uerr)
 			continue
 		}
+		// Attach here too: a container the operator renamed by hand (following the
+		// hints below) lands in this path and still needs joining to the network.
+		if aerr := takeover.AttachToCoolifygoNetwork(ctx, dc, lv.id); aerr != nil {
+			clilog.Warn("%s: network attach: %s", a.Name, aerr)
+		}
 		clilog.OK("%s already running as %s — row refreshed", a.Name, expected)
 		refreshed++
+	}
+
+	// Show what leftover v3 containers we actually saw — makes a "no match"
+	// outcome diagnosable (e.g. containers still named by their raw v3 cuid).
+	clilog.OK("found %d leftover coolify v3 container(s)", len(candidates))
+	for _, c := range candidates {
+		clilog.Info("  - %s (image %s)", c.Name, c.Image)
 	}
 
 	targets, unmatched := mapper.MatchAdoptable(broken, candidates)
 	for _, u := range unmatched {
 		clilog.Warn("%s", u)
 	}
+
+	// For any orphaned row we could not match, print the exact name coolifygo
+	// expects. The operator can `docker rename <container> <that name>` and
+	// re-run — the already-adopted path then refreshes the row automatically.
+	matchedApp := make(map[uuid.UUID]bool, len(targets))
+	for _, t := range targets {
+		matchedApp[t.AppID] = true
+	}
+	for _, a := range broken {
+		if !matchedApp[a.ID] {
+			clilog.Warn("app %q has no running container — rename the right one to %q and re-run",
+				a.Name, mapper.AppContainerName(a.ID, a.Name))
+		}
+	}
+
 	if len(targets) == 0 {
 		switch {
+		case len(broken) > 0:
+			clilog.Warn("no orphaned rows could be matched to a live v3 container (see hints above)")
 		case refreshed > 0:
 			clilog.OK("refreshed %d already-running app row(s); nothing else to adopt", refreshed)
 		default:
@@ -771,6 +809,9 @@ func printPlan(plan *mapper.Plan) {
 			status = "running"
 		}
 		clilog.Info("  - %s (%s, %s)", d.Row.Name, d.Row.Type, status)
+	}
+	for _, w := range plan.GitLinkWarnings {
+		clilog.Warn("%s", w)
 	}
 	if len(plan.OrphanWorkloads) > 0 {
 		clilog.Warn("unmatched v3 containers (claimed by no app/db): %d", len(plan.OrphanWorkloads))
