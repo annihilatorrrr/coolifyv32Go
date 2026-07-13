@@ -227,6 +227,58 @@ func TakeoverDB(ctx context.Context, dc *client.Client, in DBPlanInput) (string,
 	return resp.ID, nil
 }
 
+// AdoptApp re-homes an already-running leftover container (a v3 workload under
+// its old name, left behind by an interrupted takeover) onto coolifygo's stable
+// name WITHOUT recreating it — so there's zero downtime and no image work.
+// coolifygo's reconciler keys off the container name alone, so the rename is
+// what makes it recognise the running container as the app's. Idempotent: a
+// container already named newName is left as-is, so re-runs are safe.
+func AdoptApp(ctx context.Context, dc *client.Client, liveID, newName string) error {
+	insp, err := dc.ContainerInspect(ctx, liveID)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", liveID, err)
+	}
+	if current := strings.TrimPrefix(insp.Name, "/"); current != newName {
+		if err = dc.ContainerRename(ctx, liveID, newName); err != nil {
+			return fmt.Errorf("rename %s -> %s: %w", current, newName, err)
+		}
+	}
+	return nil
+}
+
+// AttachToCoolifygoNetwork connects an adopted container to the coolifygo
+// network, creating the network if missing. Best-effort by design: coolifygo
+// manages the container by name (reconciler) and id (stop/logs/stats) without
+// it, so the caller warns on failure rather than aborting the adoption.
+// Idempotent — a container already attached is left as-is.
+func AttachToCoolifygoNetwork(ctx context.Context, dc *client.Client, containerID string) error {
+	if err := EnsureNetwork(ctx, dc); err != nil {
+		return fmt.Errorf("ensure network: %w", err)
+	}
+	if insp, err := dc.ContainerInspect(ctx, containerID); err == nil && insp.NetworkSettings != nil {
+		if _, ok := insp.NetworkSettings.Networks[CoolifygoNetwork]; ok {
+			return nil // already attached
+		}
+	}
+	if err := dc.NetworkConnect(ctx, CoolifygoNetwork, containerID, nil); !alreadyOnNetwork(err) {
+		return fmt.Errorf("attach to %s: %w", CoolifygoNetwork, err)
+	}
+	return nil
+}
+
+// alreadyOnNetwork treats a nil error and Docker's benign "endpoint already
+// exists" surfaces as success — a container racing onto the network between
+// our inspect and connect must not fail an otherwise-complete adoption.
+func alreadyOnNetwork(err error) bool {
+	if err == nil {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already exists in network") ||
+		strings.Contains(msg, "already attached") ||
+		strings.Contains(msg, "already connected")
+}
+
 // WaitHealthy polls Docker until the container is running. Database health
 // probe is best-effort; we cap at 2 min then give up (caller logs warning).
 func WaitHealthy(ctx context.Context, dc *client.Client, containerID string, timeout time.Duration) error {

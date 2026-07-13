@@ -20,10 +20,22 @@ import (
 // before any insert or container action runs. The CLI prints it in dry-run
 // mode and re-checks it once more before going forward.
 type Plan struct {
-	GitSources  []GitSourcePlan
-	Apps        []AppPlan
-	Databases   []DBPlan
-	LocalServer uuid.UUID
+	GitSources      []GitSourcePlan
+	Apps            []AppPlan
+	Databases       []DBPlan
+	OrphanWorkloads []OrphanWorkload
+	LocalServer     uuid.UUID
+}
+
+// OrphanWorkload is a v3-managed container discovered on the host that no
+// migrated app or database claimed. A non-empty set means the migration is
+// incomplete: teardown refuses to wipe v3 while any exist, so a container whose
+// row match silently missed is never stranded or destroyed (the exact failure
+// that left running bots orphaned after an earlier run).
+type OrphanWorkload struct {
+	ContainerID string
+	Name        string
+	Image       string
 }
 
 // GitSourcePlan holds the inserted git_sources row payload plus the v3 source
@@ -234,6 +246,32 @@ func BuildPlan(
 		usedPorts[p] = fmt.Sprintf("database %q", dp.Row.Name)
 	}
 
+	// Completeness guard: every discovered v3-managed workload should map to a
+	// migrated app or database. Any that don't are recorded as orphans so the
+	// caller can refuse teardown — this is exactly the case that strands a
+	// running container (e.g. a bot whose row match silently missed) and would
+	// otherwise be destroyed when v3 is wiped.
+	matched := make(map[string]bool, len(plan.Apps)+len(plan.Databases))
+	for i := range plan.Apps {
+		if w := plan.Apps[i].Workload; w != nil {
+			matched[w.ContainerID] = true
+		}
+	}
+	for i := range plan.Databases {
+		if w := plan.Databases[i].Workload; w != nil {
+			matched[w.ContainerID] = true
+		}
+	}
+	for i := range workloads {
+		if w := workloads[i]; !matched[w.ContainerID] {
+			plan.OrphanWorkloads = append(plan.OrphanWorkloads, OrphanWorkload{
+				ContainerID: w.ContainerID,
+				Name:        w.ContainerName,
+				Image:       w.Image,
+			})
+		}
+	}
+
 	return plan, nil
 }
 
@@ -274,6 +312,103 @@ func (p *Plan) SetGitSourceID(v3SourceID string, newID uuid.UUID) {
 			p.Apps[i].Row.GitSourceID = idStr
 		}
 	}
+}
+
+// AppContainerName is the stable coolifygo container name for an application,
+// identical to coolifygo's deploy.ContainerName ("coolifygo-<slug>-<id8>").
+// Single source of truth for both the "already adopted?" check and adoption
+// targets in --oldfix.
+func AppContainerName(id uuid.UUID, name string) string {
+	return "coolifygo-" + slugify(name) + "-" + id.String()[:8]
+}
+
+// AdoptCandidate is a live, still-running container left behind by an
+// interrupted takeover (a v3 workload under its old name). HostPort is the
+// lowest published host port (0 if none), read from the live Docker binding —
+// the same host-port semantics coolifygo's Port column uses.
+type AdoptCandidate struct {
+	ID       string
+	Name     string
+	Image    string
+	HostPort int
+}
+
+// AdoptTarget pairs a coolifygo application row with the live container that
+// should be renamed into it.
+type AdoptTarget struct {
+	AppName   string
+	NewName   string
+	LiveID    string
+	LiveImage string
+	HostPort  int
+	AppID     uuid.UUID
+}
+
+// MatchAdoptable pairs orphaned application rows with leftover live containers
+// by name. Pure — no IO. Only bijective, unambiguous matches become targets:
+// an app matching zero or many candidates, or a candidate claimed by many
+// apps, is reported in unmatched and left untouched. Safety over cleverness —
+// the caller confirms interactively before renaming anything.
+func MatchAdoptable(apps []cgo.AppInfo, candidates []AdoptCandidate) (targets []AdoptTarget, unmatched []string) {
+	appMatches := make([][]int, len(apps))        // candidate idxs per app
+	candMatches := make([][]int, len(candidates)) // app idxs per candidate
+	for ai := range apps {
+		for ci := range candidates {
+			if nameMatch(apps[ai].Name, candidates[ci].Name) {
+				appMatches[ai] = append(appMatches[ai], ci)
+				candMatches[ci] = append(candMatches[ci], ai)
+			}
+		}
+	}
+	for ai := range apps {
+		a := apps[ai]
+		switch len(appMatches[ai]) {
+		case 0:
+			unmatched = append(unmatched, fmt.Sprintf("app %q: no live container matched", a.Name))
+			continue
+		case 1:
+		default:
+			unmatched = append(unmatched, fmt.Sprintf("app %q: %d live containers matched (ambiguous)", a.Name, len(appMatches[ai])))
+			continue
+		}
+		ci := appMatches[ai][0]
+		if len(candMatches[ci]) != 1 {
+			unmatched = append(unmatched, fmt.Sprintf("app %q: container %q also matches other apps (ambiguous)", a.Name, candidates[ci].Name))
+			continue
+		}
+		targets = append(targets, AdoptTarget{
+			AppID:     a.ID,
+			AppName:   a.Name,
+			NewName:   AppContainerName(a.ID, a.Name),
+			LiveID:    candidates[ci].ID,
+			LiveImage: candidates[ci].Image,
+			HostPort:  candidates[ci].HostPort,
+		})
+	}
+	return targets, unmatched
+}
+
+// nameMatch reports whether a v3 container name refers to the given app. v3
+// names workload containers by the raw cuid, but user-facing installs commonly
+// surface "<name>" or "<name>-<cuid>", so we accept an exact match, a dash/
+// underscore segment equal to the app name, or a slugified "<name>-"/"<name>_"
+// prefix. Case-insensitive throughout.
+func nameMatch(appName, containerName string) bool {
+	a := strings.ToLower(strings.TrimSpace(appName))
+	c := strings.ToLower(strings.TrimSpace(containerName))
+	if a == "" || c == "" {
+		return false
+	}
+	if a == c {
+		return true
+	}
+	for _, seg := range strings.FieldsFunc(c, func(r rune) bool { return r == '-' || r == '_' }) {
+		if seg == a {
+			return true
+		}
+	}
+	s := slugify(a)
+	return strings.HasPrefix(c, s+"-") || strings.HasPrefix(c, s+"_")
 }
 
 func indexWorkloads(workloads []discover.V3Workload, apps []v3.Application, dbs []v3.Database) map[string]discover.V3Workload {

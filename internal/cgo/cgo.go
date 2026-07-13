@@ -289,6 +289,67 @@ func (c *Client) UpdateDBContainer(ctx context.Context, id uuid.UUID, containerI
 	return nil
 }
 
+// AppInfo is the minimal read-back shape --oldfix needs to reconcile an
+// already-inserted application row against a live container. No secrets, so no
+// decryption path is involved.
+type AppInfo struct {
+	Name        string
+	ImageName   string
+	ContainerID string
+	Status      string
+	ID          uuid.UUID
+	IsBot       bool
+}
+
+// ListApplications returns every application row on the given server. Used by
+// --oldfix to find rows whose expected container isn't running. COALESCE keeps
+// the scan total-order clean for the nullable text columns.
+func (c *Client) ListApplications(ctx context.Context, serverID uuid.UUID) ([]AppInfo, error) {
+	rows, err := c.Pool.Query(ctx, `
+		SELECT id, name, COALESCE(image_name,''), COALESCE(container_id,''),
+		       COALESCE(status,''), is_bot
+		  FROM applications
+		 WHERE server_id = $1`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("list applications: %w", err)
+	}
+	defer rows.Close()
+	var out []AppInfo
+	for rows.Next() {
+		var a AppInfo
+		if err = rows.Scan(&a.ID, &a.Name, &a.ImageName, &a.ContainerID, &a.Status, &a.IsBot); err != nil {
+			return nil, fmt.Errorf("scan application: %w", err)
+		}
+		out = append(out, a)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate applications: %w", err)
+	}
+	return out, nil
+}
+
+// AdoptApplication marks an application running against a live (renamed)
+// container. Unlike UpdateAppContainer it also refreshes image_name (so the
+// reconciler can heal the app later — it recreates only when status='running'
+// AND image_name != ”) and the host port (the interrupted takeover left it at
+// 0 because no workload was matched at insert time). The COALESCE/NULLIF and
+// CASE guards leave a good image_name or an already-set port intact when the
+// caller passes "" / 0, so a refresh never clobbers correct data.
+func (c *Client) AdoptApplication(ctx context.Context, id uuid.UUID, containerID, imageName string, hostPort int) error {
+	_, err := c.Pool.Exec(ctx, `
+		UPDATE applications
+		   SET status = 'running',
+		       container_id = $2,
+		       image_name = COALESCE(NULLIF($3,''), image_name),
+		       port = CASE WHEN $4::int > 0 THEN $4 ELSE port END,
+		       updated_at = NOW()
+		 WHERE id = $1`, id, containerID, imageName, hostPort)
+	if err != nil {
+		return fmt.Errorf("adopt application %s: %w", id, err)
+	}
+	return nil
+}
+
 // GitSourceRow is the minimal column set for an inserted GitHub App.
 type GitSourceRow struct {
 	Name          string

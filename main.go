@@ -40,6 +40,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -76,6 +77,7 @@ type flags struct {
 	dryRun       bool
 	yes          bool
 	noTeardown   bool
+	oldfix       bool
 }
 
 // state is what `pre-docker` writes to disk and `post-docker` reads back.
@@ -125,6 +127,8 @@ func parseFlags() flags {
 	flag.BoolVar(&f.dryRun, "dry-run", false, "print the migration plan and exit without changing anything")
 	flag.BoolVar(&f.yes, "yes", false, "skip interactive confirmation prompts")
 	flag.BoolVar(&f.noTeardown, "no-teardown", false, "skip the v3 wipe phase")
+	flag.BoolVar(&f.oldfix, "oldfix", false,
+		"repair a broken/interrupted takeover: adopt leftover running containers into coolifygo's naming, network, and DB rows without rebuilding images or touching v3 data")
 	flag.Parse()
 	return f
 }
@@ -143,6 +147,14 @@ func run(ctx context.Context, f flags) error {
 	if f.coolifygoKey == "" {
 		return fmt.Errorf("--coolifygo-key (or $DATA_ENCRYPTION_KEY) is required")
 	}
+
+	// --oldfix is a standalone repair mode: it reads only coolifygo's Postgres
+	// and the live Docker containers, so it bypasses the v3-dependent phase
+	// pipeline entirely.
+	if f.oldfix {
+		return runOldFix(ctx, f)
+	}
+
 	switch f.phase {
 	case phaseAll, phasePreDocker, phasePostDocker:
 	default:
@@ -336,6 +348,20 @@ func runTakeoverAndTeardown(ctx context.Context, f flags, plan *mapper.Plan) err
 		return nil
 	}
 
+	// Completeness gate: refuse to wipe v3 while any discovered container went
+	// unmatched. Wiping here is what turned an earlier incomplete takeover into
+	// an unrecoverable state (v3 SQLite + volumes gone, workloads stranded).
+	// Overrides --yes on purpose — never destroy v3 when the picture is partial.
+	if len(plan.OrphanWorkloads) > 0 {
+		clilog.Phase(7, 7, "teardown (refused — incomplete migration)")
+		clilog.Warn("%d v3 container(s) were discovered but not migrated:", len(plan.OrphanWorkloads))
+		for _, o := range plan.OrphanWorkloads {
+			clilog.Warn("  - %s (%s)", o.Name, short(o.ContainerID))
+		}
+		clilog.Warn("v3 is left intact so nothing is stranded. Investigate the unmatched containers, fix the mapping, and re-run — or wipe v3 by hand once you've confirmed they're safe to drop.")
+		return nil
+	}
+
 	clilog.Phase(7, 7, "wipe v3 install")
 	if !clilog.Confirm("Wipe v3 containers, volumes (incl. copied-from database volumes), images, network, host paths?", f.yes) {
 		clilog.Warn("teardown skipped by user")
@@ -356,6 +382,177 @@ func runTakeoverAndTeardown(ctx context.Context, f flags, plan *mapper.Plan) err
 		os.Remove(filepath.Dir(f.stateFile))
 	}
 	return nil
+}
+
+// runOldFix repairs a host left broken by an interrupted takeover: coolifygo
+// holds the application rows but the workload containers are still running
+// under their old v3 names (never renamed), so coolifygo shows them
+// stopped / container-less. It reads ONLY coolifygo's Postgres and the live
+// Docker daemon — no v3 SQLite, no state file, no image rebuild — and adopts
+// each leftover container by renaming it to coolifygo's stable name, attaching
+// it to the coolifygo network, and writing the live container id, image, host
+// port, and running status back onto the row. A safe no-op when nothing is
+// broken; re-runnable.
+func runOldFix(ctx context.Context, f flags) error {
+	clilog.Phase(1, 3, "connect docker + coolifygo")
+	dc, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return fmt.Errorf("docker client: %w", err)
+	}
+	defer dc.Close()
+
+	target, err := cgo.Open(ctx, f.coolifygoDSN, f.coolifygoKey)
+	if err != nil {
+		return err
+	}
+	defer target.Close()
+
+	server, err := target.FindLocalServer(ctx)
+	if err != nil {
+		return err
+	}
+	clilog.OK("local server row: %s", server)
+
+	apps, err := target.ListApplications(ctx, server)
+	if err != nil {
+		return fmt.Errorf("list coolifygo applications: %w", err)
+	}
+	clilog.OK("coolifygo has %d application row(s)", len(apps))
+
+	// A single running-container snapshot drives both the "already adopted?"
+	// check and the leftover-candidate list — no per-container inspect.
+	running, err := dc.ContainerList(ctx, container.ListOptions{All: false})
+	if err != nil {
+		return fmt.Errorf("list running containers: %w", err)
+	}
+	type live struct {
+		id   string
+		port int
+	}
+	byName := make(map[string]live, len(running))
+	var candidates []mapper.AdoptCandidate
+	for i := range running {
+		c := running[i]
+		name := stripName(c.Names)
+		port := lowestPublicPort(c.Ports)
+		byName[name] = live{id: c.ID, port: port}
+		// A candidate is a leftover workload container: anything not already
+		// coolifygo-managed. We deliberately do NOT require v3's
+		// `coolify.managed` label — the matching failure that stranded these
+		// containers may itself be a labelling quirk, so we stay lenient and
+		// lean on the bijective name match + interactive confirmation for
+		// safety rather than a filter that might exclude the very containers we
+		// need to fix.
+		if strings.HasPrefix(name, "coolifygo") || c.Labels["coolifygo.managed"] == "true" {
+			continue
+		}
+		candidates = append(candidates, mapper.AdoptCandidate{
+			ID: c.ID, Name: name, Image: c.Image, HostPort: port,
+		})
+	}
+
+	clilog.Phase(2, 3, "match orphaned rows to live containers")
+	var broken []cgo.AppInfo
+	refreshed := 0
+	for _, a := range apps {
+		expected := mapper.AppContainerName(a.ID, a.Name)
+		lv, ok := byName[expected]
+		if !ok {
+			broken = append(broken, a)
+			continue
+		}
+		// Already running under the coolifygo name. Refresh the row only if it
+		// has drifted (empty/stale container_id or non-running status) so
+		// Stop/Logs/Stats target the live container.
+		if a.ContainerID == lv.id && a.Status == "running" {
+			continue
+		}
+		if uerr := target.AdoptApplication(ctx, a.ID, lv.id, a.ImageName, lv.port); uerr != nil {
+			clilog.Warn("%s: refresh row: %s", a.Name, uerr)
+			continue
+		}
+		clilog.OK("%s already running as %s — row refreshed", a.Name, expected)
+		refreshed++
+	}
+
+	targets, unmatched := mapper.MatchAdoptable(broken, candidates)
+	for _, u := range unmatched {
+		clilog.Warn("%s", u)
+	}
+	if len(targets) == 0 {
+		switch {
+		case refreshed > 0:
+			clilog.OK("refreshed %d already-running app row(s); nothing else to adopt", refreshed)
+		default:
+			clilog.OK("nothing to adopt — every application row already maps to a running container")
+		}
+		return nil
+	}
+
+	clilog.Info("proposed adoptions:")
+	for _, t := range targets {
+		portNote := ""
+		if t.HostPort > 0 {
+			portNote = fmt.Sprintf(", host port %d", t.HostPort)
+		}
+		clilog.Info("  - %s (%s) → %s%s", t.AppName, short(t.LiveID), t.NewName, portNote)
+	}
+
+	clilog.Phase(3, 3, "adopt containers")
+	if !clilog.Confirm("Rename these live containers into coolifygo and update their rows?", f.yes) {
+		clilog.Warn("aborted by user")
+		return nil
+	}
+
+	adopted := 0
+	for _, t := range targets {
+		if err = takeover.AdoptApp(ctx, dc, t.LiveID, t.NewName); err != nil {
+			clilog.Warn("%s: %s", t.AppName, err)
+			continue
+		}
+		// Network attach is best-effort: coolifygo manages by name + id without
+		// it. A failure here must not block the row writeback.
+		if aerr := takeover.AttachToCoolifygoNetwork(ctx, dc, t.LiveID); aerr != nil {
+			clilog.Warn("%s: network attach: %s", t.AppName, aerr)
+		}
+		if err = target.AdoptApplication(ctx, t.AppID, t.LiveID, t.LiveImage, t.HostPort); err != nil {
+			clilog.Warn("%s: renamed but row writeback failed: %s", t.AppName, err)
+			continue
+		}
+		clilog.OK("%s adopted as %s", t.AppName, t.NewName)
+		adopted++
+	}
+	if refreshed > 0 {
+		clilog.OK("adopted %d of %d container(s); also refreshed %d already-running row(s)", adopted, len(targets), refreshed)
+	} else {
+		clilog.OK("adopted %d of %d container(s)", adopted, len(targets))
+	}
+	return nil
+}
+
+// stripName returns the first container name without Docker's leading slash.
+func stripName(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return strings.TrimPrefix(names[0], "/")
+}
+
+// lowestPublicPort returns the lowest published host port across a container's
+// port list (0 if none). Mirrors mapper.firstHostPort's deterministic choice so
+// an adopted row carries the same host-port semantics coolifygo's Port uses.
+func lowestPublicPort(ports []container.Port) int {
+	lowest := 0
+	for _, p := range ports {
+		if p.PublicPort == 0 {
+			continue
+		}
+		hp := int(p.PublicPort)
+		if lowest == 0 || hp < lowest {
+			lowest = hp
+		}
+	}
+	return lowest
 }
 
 func saveState(path string, plan *mapper.Plan) error {
@@ -442,7 +639,15 @@ func runTakeover(ctx context.Context, dc *client.Client, target *cgo.Client, pla
 	var reclaimVols []string
 	for i := range plan.Apps {
 		ap := plan.Apps[i]
-		if ap.NewID == uuid.Nil || ap.Workload == nil {
+		if ap.NewID == uuid.Nil {
+			continue
+		}
+		// A nil workload means no v3 container was matched to this row. Never
+		// silent: an app that should have a container but didn't match is the
+		// bug that strands workloads, and it also surfaces as an orphan that
+		// blocks teardown.
+		if ap.Workload == nil {
+			clilog.Warn("%s: no v3 container matched — left as status=%s, not taken over", ap.Row.Name, ap.Row.Status)
 			continue
 		}
 		start := ap.Workload.Running
@@ -485,7 +690,11 @@ func runTakeover(ctx context.Context, dc *client.Client, target *cgo.Client, pla
 
 	for i := range plan.Databases {
 		dp := plan.Databases[i]
-		if dp.NewID == uuid.Nil || dp.Workload == nil {
+		if dp.NewID == uuid.Nil {
+			continue
+		}
+		if dp.Workload == nil {
+			clilog.Warn("%s: no v3 container matched — left as status=%s, not taken over", dp.Row.Name, dp.Row.Status)
 			continue
 		}
 		start := dp.Workload.Running
@@ -562,6 +771,13 @@ func printPlan(plan *mapper.Plan) {
 			status = "running"
 		}
 		clilog.Info("  - %s (%s, %s)", d.Row.Name, d.Row.Type, status)
+	}
+	if len(plan.OrphanWorkloads) > 0 {
+		clilog.Warn("unmatched v3 containers (claimed by no app/db): %d", len(plan.OrphanWorkloads))
+		for _, o := range plan.OrphanWorkloads {
+			clilog.Warn("  - %s (%s)", o.Name, short(o.ContainerID))
+		}
+		clilog.Warn("teardown will be refused while these exist — they would otherwise be destroyed with v3")
 	}
 }
 
