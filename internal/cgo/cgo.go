@@ -332,9 +332,13 @@ func (c *Client) ListApplications(ctx context.Context, serverID uuid.UUID) ([]Ap
 // container. Unlike UpdateAppContainer it also refreshes image_name (so the
 // reconciler can heal the app later — it recreates only when status='running'
 // AND image_name != ”) and the host port (the interrupted takeover left it at
-// 0 because no workload was matched at insert time). The COALESCE/NULLIF and
-// CASE guards leave a good image_name or an already-set port intact when the
-// caller passes "" / 0, so a refresh never clobbers correct data.
+// 0 because no workload was matched at insert time). A detected host port also
+// forces is_bot=false: an app exposed on the host can't be a network-only
+// bot/worker, and coolifygo binds the host port only when port>0 && !is_bot, so
+// a stale is_bot=true would make the reconciler/restart drop the binding even
+// though the adopted (renamed) container still has it. The COALESCE/NULLIF and
+// CASE guards leave a good image_name / already-set port / non-bot flag intact
+// when the caller passes "" / 0, so a refresh never clobbers correct data.
 func (c *Client) AdoptApplication(ctx context.Context, id uuid.UUID, containerID, imageName string, hostPort int) error {
 	_, err := c.Pool.Exec(ctx, `
 		UPDATE applications
@@ -342,6 +346,7 @@ func (c *Client) AdoptApplication(ctx context.Context, id uuid.UUID, containerID
 		       container_id = $2,
 		       image_name = COALESCE(NULLIF($3,''), image_name),
 		       port = CASE WHEN $4::int > 0 THEN $4 ELSE port END,
+		       is_bot = CASE WHEN $4::int > 0 THEN false ELSE is_bot END,
 		       updated_at = NOW()
 		 WHERE id = $1`, id, containerID, imageName, hostPort)
 	if err != nil {

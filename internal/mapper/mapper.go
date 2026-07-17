@@ -183,8 +183,18 @@ func BuildPlan(
 			// If v3 had this container exposed on a host port, carry it over.
 			// coolifygo's Port field = host binding, so we use the actual
 			// published host port from Docker, not v3's internal port field.
+			// A published host port also means the app is genuinely exposed, so
+			// it cannot be a coolifygo "bot/worker": is_bot=true suppresses the
+			// host bind in BOTH takeover and coolifygo's BuildAppContainerConfig
+			// (both gate on Port>0 && !IsBot). Leaving is_bot=true with port>0
+			// would persist a row whose App URL advertises a port nothing binds
+			// — reachable until the first recreate (restart/reconcile), then
+			// ERR_CONNECTION_REFUSED. Reconcile the pair, mirroring the
+			// IsPublic/PublicPort handling for databases below: an exposed app is
+			// never a bot, regardless of v3's isBot flag.
 			if hp := firstHostPort(w.PortBindings); hp > 0 {
 				ap.Row.Port = hp
+				ap.Row.IsBot = false
 			}
 		} else {
 			ap.Row.Status = "stopped"
@@ -363,13 +373,13 @@ type AdoptTarget struct {
 // MatchAdoptable pairs orphaned application rows with leftover live containers.
 // Pure — no IO. Two passes:
 //
-//	1. Deterministic: the row's seeded container_id points straight at a live
-//	   container (the insert phase stamps v3's id onto the row when it matched a
-//	   workload). No name guessing — this wins, because v3 names workload
-//	   containers by raw cuid, which rarely equals the human app name.
-//	2. Bijective name match on the leftovers. An app matching zero or many
-//	   candidates, or a candidate claimed by many apps, is reported in unmatched
-//	   and left untouched.
+//  1. Deterministic: the row's seeded container_id points straight at a live
+//     container (the insert phase stamps v3's id onto the row when it matched a
+//     workload). No name guessing — this wins, because v3 names workload
+//     containers by raw cuid, which rarely equals the human app name.
+//  2. Bijective name match on the leftovers. An app matching zero or many
+//     candidates, or a candidate claimed by many apps, is reported in unmatched
+//     and left untouched.
 //
 // Safety over cleverness — the caller confirms interactively before renaming
 // anything, and prints the expected container name for whatever stays unmatched
