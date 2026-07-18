@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/annihilatorrrr/coolifyv32Go/internal/cgo"
@@ -469,10 +470,8 @@ func nameMatch(appName, containerName string) bool {
 	if a == c {
 		return true
 	}
-	for _, seg := range strings.FieldsFunc(c, func(r rune) bool { return r == '-' || r == '_' }) {
-		if seg == a {
-			return true
-		}
+	if slices.Contains(strings.FieldsFunc(c, func(r rune) bool { return r == '-' || r == '_' }), a) {
+		return true
 	}
 	s := slugify(a)
 	return strings.HasPrefix(c, s+"-") || strings.HasPrefix(c, s+"_")
