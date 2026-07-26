@@ -88,6 +88,7 @@ func TakeoverApp(ctx context.Context, dc *client.Client, in AppPlanInput) (strin
 	}
 	hostCfg := &container.HostConfig{
 		RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
+		Init:          new(true), // tini as PID 1 — reaps orphaned children (matches coolifygo RunContainer)
 	}
 	exposed := nat.PortSet{}
 	if in.Port > 0 && !in.IsBot {
@@ -182,6 +183,7 @@ func TakeoverDB(ctx context.Context, dc *client.Client, in DBPlanInput) (string,
 
 	hostCfg := &container.HostConfig{
 		RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
+		Init:          new(true), // tini as PID 1 — reaps orphaned children (matches coolifygo RunContainer)
 		Mounts: []mount.Mount{{
 			Type:   mount.TypeVolume,
 			Source: newVol,
@@ -318,7 +320,7 @@ func WaitHealthy(ctx context.Context, dc *client.Client, containerID string, tim
 // stopAndRemove tolerates "not found" so a post-docker re-run after a partial
 // takeover doesn't blow up on containers we already removed last time.
 func stopAndRemove(ctx context.Context, dc *client.Client, id string) error {
-	dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
+	_ = dc.ContainerStop(ctx, id, container.StopOptions{Timeout: new(30)})
 	if err := dc.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
 		return err
 	}
@@ -382,7 +384,7 @@ func pullImage(ctx context.Context, dc *client.Client, ref string) error {
 		return err
 	}
 	defer rc.Close()
-	io.Copy(io.Discard, rc) // drain so the pull completes
+	_, _ = io.Copy(io.Discard, rc) // drain so the pull completes
 	return nil
 }
 
@@ -518,6 +520,6 @@ func firstNonEmpty(s ...string) string {
 // shortRand returns 8 random hex chars for ephemeral container names.
 func shortRand() string {
 	var b [4]byte
-	io.ReadFull(rand.Reader, b[:])
+	_, _ = io.ReadFull(rand.Reader, b[:])
 	return hex.EncodeToString(b[:])
 }
